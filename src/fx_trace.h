@@ -29,6 +29,8 @@ void bb_fx_trace_destroyed(uint64_t instance);
 void bb_fx_trace_updated(uint64_t instance, float dt);
 /* An effect node created under an instance (its root, or a spawned child). */
 void bb_fx_trace_node(uint64_t instance);
+/* A child effect `id` spawned under `parent_node`, inside that node's instance. */
+void bb_fx_trace_child(int32_t id, uint64_t parent_node);
 /* The once-a-second lines; `list_head` holds the library's list of live instances. */
 void bb_fx_trace_report(uint64_t list_head, uint64_t now_us);
 

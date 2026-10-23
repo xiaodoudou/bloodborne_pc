@@ -1,13 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * fx_trace.c on hand-made effect instances: the node and handle walks follow the library's
- * layout, the event and once-a-second lines carry the ids, counts, flags and callers, ids are
- * selected from BB_FX_TRACE_ID's forms, and the event lines stay within their budget. */
+ * layout, the event and once-a-second lines carry the ids, counts, flags, child effects and
+ * callers, ids are selected from BB_FX_TRACE_ID's forms, and the event budget refills each
+ * wall-clock second while the hooks themselves start the report. */
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <windows.h>
 #include "fx_trace.h"
 
 enum { TRAIL = 1251720, OTHER = 42 };
@@ -104,6 +106,9 @@ int main(void) {
     bb_fx_trace_node(at(&inst[0]));
     bb_fx_trace_node(at(&inst[0]));
     bb_fx_trace_node(at(&inst[2]));
+    bb_fx_trace_child(TRAIL, at(&node[1]));  /* logged: a followed id */
+    bb_fx_trace_child(OTHER, at(&node[0]));  /* counted: inside a followed instance */
+    bb_fx_trace_child(OTHER, at(&node[5]));  /* neither */
     put32(&inst[0], 0x88, 3 | 8);  /* what the stop then sets */
     bb_fx_trace_flagged(at(&inst[0]), 0, (uint64_t)(uintptr_t)&stop_return, frame);
     bb_fx_trace_flagged(at(&inst[0]), 0, 0, 0);
@@ -111,9 +116,10 @@ int main(void) {
     bb_fx_trace_destroyed(at(&inst[1]));
     bb_fx_trace_report(list, now_us());
 
-    /* "all": every id, the top live ids from the library's list. */
+    /* "all": every id; the top ids by instances and nodes from the library's list. */
     bb_fx_trace_select("all");
     bb_fx_trace_created(at(&inst[2]), 0);
+    bb_fx_trace_child(OTHER, at(&node[5]));
     bb_fx_trace_report(list, now_us());
     /* A list: only those ids. */
     bb_fx_trace_select("7,42");
@@ -128,6 +134,11 @@ int main(void) {
         bb_fx_trace_created(at(&many[i]), 0);
     }
     bb_fx_trace_report(list, now_us());
+    /* A second later the budget is back without a report, and the next hook call reports. */
+    Sleep(1100);
+    static Block late;
+    make_instance(&late, TRAIL);
+    bb_fx_trace_created(at(&late), 0);
     fflush(stdout);
 
     const char *text = slurp(log);
@@ -142,23 +153,36 @@ int main(void) {
     assert(strstr(text, want));
     assert(strstr(text, " nodes=5 handles=3 live=2 from=0x333<0x111<0x222\n"));
     assert(strstr(text, " nodes=5 handles=3 live=2 again from=?\n"));
-    assert(strstr(text, "FX: second id=1251720 live=2 list=2 nodes=[5,0] new=[2,0] handles=[3,0] "
-                        "state=[stop,run] age=[2.0,2.0] dt=0.0111 dtmin=0.0111 dtmax=0.0111 dt_any=0.5000 "
-                        "updates=3 frames=0 total=3 untracked=0 suppressed=0\n"));
+    snprintf(want, sizeof(want), "FX: child 1251720 in=1251720 inst=0x%llx parent=0x%llx\n",
+             (unsigned long long)at(&inst[0]), (unsigned long long)at(&node[1]));
+    assert(strstr(text, want));
+    assert(count_of(text, "FX: child ") == 1);
+    assert(strstr(text, "FX: second id=1251720 live=2 list=2 created=2 nodes=[5,0] new=[2,0] handles=[3,0] "
+                        "state=[stop,run] age=[2.0,2.0] child=1 child_in=1251720 children=2 dt=0.0111 "
+                        "dtmin=0.0111 dtmax=0.0111 dt_any=0.5000 updates=3 frames=? total=3 untracked=0 "
+                        "suppressed=0\n"));
     snprintf(want, sizeof(want), "FX: destroy 1251720 inst=0x%llx age=", (unsigned long long)at(&inst[1]));
     assert(strstr(text, want));
     assert(strstr(text, " stopped=0 killed=0 live=1\n"));
-    assert(strstr(text, "FX: second id=1251720 live=1 list=2 nodes=[5] new=[0] handles=[3] state=[stop] "));
-    assert(strstr(text, " updates=0 frames=0 total=3 "));
+    assert(strstr(text, "FX: second id=1251720 live=1 list=2 created=0 nodes=[5] new=[0] handles=[3] "
+                        "state=[stop] "));
+    assert(strstr(text, " child=0 child_in=0 children=0 "));
+    assert(strstr(text, " updates=0 frames=? total=3 "));
     assert(count_of(text, "FX: create 42 ") == 2);
-    assert(strstr(text, "FX: second all live=1 top=[1251720:2,42:1] "));
-    assert(strstr(text, "FX: second id=7 live=0 list=0 nodes=[] new=[] handles=[] state=[] age=[] "));
-    assert(strstr(text, "FX: second id=42 live=1 list=1 nodes=[0] "));
+    snprintf(want, sizeof(want), "FX: second all live=1 nodes=5 top_live=[1251720:2,42:1] "
+             "top_nodes=[1251720:5/2] biggest=1251720:5@0x%llx top_created=[42:1] top_child=[42:1<42] ",
+             (unsigned long long)at(&inst[0]));
+    assert(strstr(text, want));
+    assert(strstr(text, "FX: second id=7 live=0 list=0 created=0 nodes=[] new=[] handles=[] state=[] age=[] "));
+    assert(strstr(text, "FX: second id=42 live=1 list=1 created=1 nodes=[0] "));
     assert(!strstr(text, "FX: create 1251720 inst=0x0"));
-    assert(count_of(text, "FX: create 1251720 ") == 2 + 40);
-    assert(strstr(text, "FX: second id=1251720 live=60 list=2 "));
+    assert(count_of(text, "FX: create 1251720 ") == 2 + 40 + 1);
+    assert(strstr(text, "FX: second id=1251720 live=60 list=2 created=60 "));
     assert(strstr(text, " more=36 "));
     assert(strstr(text, " suppressed=20\n"));
+    snprintf(want, sizeof(want), "FX: create 1251720 inst=0x%llx live=61 ", (unsigned long long)at(&late));
+    assert(strstr(text, want));
+    assert(strstr(text, "FX: second id=1251720 live=60 list=0 created=0 "));  /* from the hook, no list */
     remove(log);
     fprintf(stderr, "fx trace: ok\n");
     return 0;

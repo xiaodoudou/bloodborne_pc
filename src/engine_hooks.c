@@ -2,6 +2,7 @@
  * Guarded hooks into the loaded game image (engine_hooks.h). */
 #include "engine_hooks.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
@@ -157,7 +158,11 @@ static BB_GUEST_ABI void main_frame(void) {
 
 int bb_main_frame_install(void) {
     if (!g_tick_count) return 0;
-    return !bb_hook_entry(BB_BN(FRAME_MANAGER), frame_manager_prologue, (void *)main_frame);
+    if (!bb_hook_entry(BB_BN(FRAME_MANAGER), frame_manager_prologue, (void *)main_frame)) return 1;
+    /* Atlas lamp travel (BB_MAP_TRAVEL_ENABLED=1) patches this entry before the engine hooks. */
+    printf("Main-frame tick: not hooked (%s); %d once-a-frame feature step(s) will not run\n", g_error,
+           g_tick_count);
+    return 0;
 }
 
 int bb_patch(uint64_t at, const void *expected, const void *replacement, size_t n) {

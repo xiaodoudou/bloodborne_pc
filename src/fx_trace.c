@@ -12,8 +12,12 @@
  * Stop (sub_2850780) sets flag 8, which the root nodes' state machine reads to end. Kill
  * (sub_284ff20) sets flag 4: the next update (sub_284ff30, with the frame time in xmm0) frees the
  * whole tree. Once an instance has no nodes left, the collector (sub_2850d30) releases it
- * (sub_284fd50) and frees it. Emitters add child nodes (sub_2853560), so the node count stands in
- * for the particle count.
+ * (sub_284fd50) and frees it. Emitters add child effects by id inside an instance (sub_2853560,
+ * no new instance), so an effect can live only as nodes of another; the node count stands in for
+ * the particle count.
+ *
+ * The once-a-second report runs from whichever hook first sees the second end: the main-frame
+ * tick is not there when another patch took that function's entry (Atlas lamp travel does).
  *
  * Only reads: the hooks run before the game's own instructions and change no register or memory.
  *
@@ -35,6 +39,7 @@ enum {
     INSTANCE_RELEASE = 0x284fd50, /* (instance), from the collector before the free */
     INSTANCE_UPDATE = 0x284ff30,  /* (instance, context, float dt) */
     NODE_CREATE = 0x284daa0,      /* (system, pos, matrix, def, instance, parent, ...) */
+    CHILD_EFFECT = 0x2853560,     /* (system, effect id, def, ?, ?, parent node, ...) */
     LIVE_LIST = 0x54b0000,
 };
 static const BbCode create_return_code = {6, 0x08d07dc40feaa530ull};
@@ -43,11 +48,22 @@ static const BbCode kill_code = {7, 0x3c13cc4b3a59e2b4ull};
 static const BbCode release_code = {15, 0x112fb6ddc4b7e884ull};
 static const BbCode update_code = {20, 0xc56331ff3adcd756ull};
 static const BbCode node_create_code = {21, 0x8e1c12827986e080ull};
+static const BbCode child_effect_code = {20, 0x60b885ecf8e57f6bull};
 
 enum { INST_ID = 0x00, INST_NEXT = 0x70, INST_ROOT = 0x78, INST_FLAGS = 0x88, INST_HANDLES = 0x90 };
 enum { NODE_INSTANCE = 0x58, HANDLE_NEXT = 0x18, FLAG_KILL = 4, FLAG_STOP = 8 };
-enum { DEFAULT_ID = 1251720, MAX_IDS = 16, MAX_TRACKED = 1024, SHOWN = 24, TOP = 8,
-       EVENT_BUDGET = 40, DEPTH = 4, NODE_CAP = 100000, LIST_CAP = 200000, CODE_END = 0x4000000 };
+enum { DEFAULT_ID = 1251720, MAX_IDS = 16, MAX_TRACKED = 1024, SHOWN = 24, TOP = 8, CHILD_SLOTS = 1024,
+       EVENT_BUDGET = 40, DEPTH = 6, NODE_CAP = 100000, LIST_CAP = 200000, ALL_NODES_CAP = 400000,
+       CODE_END = 0x4000000 };
+static const uint64_t SECOND = 1000000;
+
+/* Child effects spawned per id since the last report, with the id of the last instance holding one. */
+typedef struct {
+    int32_t id, parent_id;
+    uint32_t n;
+} ChildCount;
+static ChildCount g_children[CHILD_SLOTS], g_creations[CHILD_SLOTS];  /* creations: parent_id unused */
+static ChildCount *count_slot(ChildCount *table, int32_t id);
 
 typedef struct {
     uint64_t instance, created_us;
@@ -62,6 +78,8 @@ static Tracked g_tracked[MAX_TRACKED];
 static int g_count;
 static atomic_uint g_untracked, g_events, g_suppressed, g_updates, g_frames;
 static atomic_uint g_dt_last, g_dt_min, g_dt_max, g_dt_any;  /* float bits */
+static atomic_ullong g_next_report, g_window;                /* microseconds */
+static atomic_int g_ticking;
 static atomic_flag g_lock = ATOMIC_FLAG_INIT;
 
 static void lock(void) {
@@ -74,6 +92,10 @@ static uint64_t now_us(void) {
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
 }
+
+/* printf into out[used..size), returning the new length. */
+static size_t append(char *out, size_t size, size_t used, const char *format, ...)
+    __attribute__((format(printf, 4, 5)));
 
 static uint64_t read64(uint64_t address) {
     uint64_t v = 0;
@@ -111,7 +133,12 @@ void bb_fx_trace_select(const char *ids) {
     if (!g_all && !g_id_count) g_ids[g_id_count++] = DEFAULT_ID;
     lock();
     g_count = 0;
+    memset(g_children, 0, sizeof(g_children));
+    memset(g_creations, 0, sizeof(g_creations));
     unlock();
+    const uint64_t now = now_us();
+    atomic_store(&g_window, now);
+    atomic_store(&g_next_report, now + SECOND);
     atomic_store(&g_untracked, 0);
     atomic_store(&g_events, 0);
     atomic_store(&g_suppressed, 0);
@@ -133,11 +160,23 @@ static int live_of(int32_t id) {
     return n;
 }
 
-/* Lines beyond the per-second budget are counted in the next report instead. */
+/* Lines beyond the budget of each wall-clock second are counted in the next report instead. */
 static int may_log(void) {
+    const uint64_t now = now_us();
+    uint64_t start = atomic_load(&g_window);
+    if (now - start >= SECOND && atomic_compare_exchange_strong(&g_window, &start, now))
+        atomic_store(&g_events, 0);
     if (atomic_fetch_add(&g_events, 1) < EVENT_BUDGET) return 1;
     atomic_fetch_add(&g_suppressed, 1);
     return 0;
+}
+
+/* Run by whichever hook first sees the second over (one thread wins the exchange). */
+static void maybe_report(void) {
+    const uint64_t now = now_us();
+    uint64_t due = atomic_load_explicit(&g_next_report, memory_order_relaxed);
+    if (now < due || !atomic_compare_exchange_strong(&g_next_report, &due, now + SECOND)) return;
+    bb_fx_trace_report((uint64_t)(uintptr_t)bb_guest(LIVE_LIST), now);
 }
 
 static uint64_t code_offset(uint64_t address) {
@@ -163,9 +202,12 @@ static void format_from(char *out, size_t size, uint64_t first, uint64_t frame) 
 }
 
 void bb_fx_trace_created(uint64_t instance, uint64_t frame) {
+    maybe_report();
     int32_t id;
     if (!read_id(instance, &id) || !followed(id)) return;
     lock();
+    ChildCount *made = count_slot(g_creations, id);
+    if (made) made->id = id, ++made->n;
     if (!find(instance)) {
         if (g_count < MAX_TRACKED)
             g_tracked[g_count++] = (Tracked){.instance = instance, .created_us = now_us(), .id = id};
@@ -240,6 +282,7 @@ static void keep_extreme(atomic_uint *slot, float dt, int want_min) {
 }
 
 void bb_fx_trace_updated(uint64_t instance, float dt) {
+    maybe_report();
     atomic_store_explicit(&g_dt_any, float_bits(dt), memory_order_relaxed);
     int32_t id;
     if (!read_id(instance, &id) || !followed(id)) return;
@@ -256,6 +299,31 @@ void bb_fx_trace_node(uint64_t instance) {
     Tracked *t = find(instance);
     if (t) ++t->nodes_made;
     unlock();
+}
+
+static ChildCount *count_slot(ChildCount *table, int32_t id) {
+    for (unsigned i = (uint32_t)id * 2654435761u % CHILD_SLOTS, probes = 0; probes < CHILD_SLOTS;
+         i = (i + 1) % CHILD_SLOTS, ++probes)
+        if (!table[i].n || table[i].id == id) return &table[i];
+    return NULL;
+}
+
+void bb_fx_trace_child(int32_t id, uint64_t parent_node) {
+    uint64_t instance = 0;
+    int32_t parent_id = 0;
+    if (parent_node) memcpy(&instance, (const void *)(uintptr_t)(parent_node + NODE_INSTANCE), 8);
+    if (!read_id(instance, &parent_id)) parent_id = 0;
+    const int wanted = !g_all && followed(id);
+    if (!g_all && !wanted && !followed(parent_id)) return;
+    lock();
+    ChildCount *c = count_slot(g_children, id);
+    if (c) c->id = id, c->parent_id = parent_id, ++c->n;
+    unlock();
+    /* Under "all" these would use up the budget the instance events need. */
+    if (!wanted || !may_log()) return;
+    printf("FX: child %d in=%d inst=0x%llx parent=0x%llx\n", id, parent_id, (unsigned long long)instance,
+           (unsigned long long)parent_node);
+    fflush(stdout);
 }
 
 int bb_fx_trace_nodes(uint64_t instance, int cap) {
@@ -284,25 +352,56 @@ int bb_fx_trace_handles(uint64_t instance, int cap) {
 
 typedef struct {
     int32_t id;
-    int n;
+    int n, nodes;
 } IdCount;
 
-/* Counts the library's live instances, per followed id (or per id, for "all"). */
-static int walk_live(uint64_t list_head, IdCount *counts, int slots) {
-    int total = 0;
-    for (uint64_t inst = read64(list_head); inst && total < LIST_CAP; inst = read64(inst + INST_NEXT)) {
-        ++total;
+typedef struct {
+    int total, nodes, biggest_nodes;
+    int32_t biggest_id;
+    uint64_t biggest;
+} LiveWalk;
+
+/* Counts the library's live instances per followed id (or per id, for "all", with their nodes). */
+static LiveWalk walk_live(uint64_t list_head, IdCount *counts, int slots) {
+    LiveWalk w = {0};
+    for (uint64_t inst = read64(list_head); inst && w.total < LIST_CAP; inst = read64(inst + INST_NEXT)) {
+        ++w.total;
         int32_t id;
         if (!bb_read(inst + INST_ID, &id, 4) || !followed(id)) continue;
+        const int nodes = g_all && w.nodes < ALL_NODES_CAP ? bb_fx_trace_nodes(inst, NODE_CAP) : 0;
+        w.nodes += nodes;
+        if (nodes > w.biggest_nodes) w.biggest_nodes = nodes, w.biggest_id = id, w.biggest = inst;
         for (int i = (int)((uint32_t)id * 2654435761u % (uint32_t)slots), probes = 0; probes < slots;
              i = (i + 1) % slots, ++probes) {
             if (counts[i].n && counts[i].id != id) continue;
             counts[i].id = id;
             ++counts[i].n;
+            counts[i].nodes += nodes;
             break;
         }
     }
-    return total;
+    return w;
+}
+
+/* " name=[id:value,...]" for the TOP ids by `by` (0 instances, 1 nodes); `counts` is reordered. */
+static size_t append_top(char *out, size_t size, size_t used, const char *name, IdCount *counts, int slots,
+                         int by) {
+    used = append(out, size, used, " %s=[", name);
+    for (int shown = 0; shown < TOP; ++shown) {
+        int best = -1;
+        for (int i = shown; i < slots; ++i) {
+            const int value = by ? counts[i].nodes : counts[i].n;
+            if (counts[i].n > 0 && value > 0 && (best < 0 || value > (by ? counts[best].nodes : counts[best].n)))
+                best = i;
+        }
+        if (best < 0) break;
+        const IdCount top = counts[best];
+        counts[best] = counts[shown];
+        counts[shown] = top;
+        used = by ? append(out, size, used, "%s%d:%d/%d", shown ? "," : "", top.id, top.nodes, top.n)
+                  : append(out, size, used, "%s%d:%d", shown ? "," : "", top.id, top.n);
+    }
+    return append(out, size, used, "]");
 }
 
 static int list_count(const IdCount *counts, int slots, int32_t id) {
@@ -316,8 +415,6 @@ static int by_age(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
-static size_t append(char *out, size_t size, size_t used, const char *format, ...)
-    __attribute__((format(printf, 4, 5)));
 static size_t append(char *out, size_t size, size_t used, const char *format, ...) {
     if (used >= size) return used;
     va_list args;
@@ -360,9 +457,10 @@ void bb_fx_trace_report(uint64_t list_head, uint64_t now) {
     static Tracked snap[MAX_TRACKED];
     static uint32_t made[MAX_TRACKED];
     static IdCount counts[2048];
+    static ChildCount children[CHILD_SLOTS], creations[CHILD_SLOTS];
     enum { SLOTS = sizeof(counts) / sizeof(*counts) };
     memset(counts, 0, sizeof(counts));
-    const int total = walk_live(list_head, counts, SLOTS);
+    const LiveWalk walk = walk_live(list_head, counts, SLOTS);
 
     lock();
     const int n = g_count;
@@ -370,30 +468,50 @@ void bb_fx_trace_report(uint64_t list_head, uint64_t now) {
         snap[i] = g_tracked[i];
         g_tracked[i].nodes_seen = g_tracked[i].nodes_made;
     }
+    memcpy(children, g_children, sizeof(children));
+    memset(g_children, 0, sizeof(g_children));
+    memcpy(creations, g_creations, sizeof(creations));
+    memset(g_creations, 0, sizeof(g_creations));
     unlock();
     qsort(snap, (size_t)n, sizeof(*snap), by_age);
     for (int i = 0; i < n; ++i) made[i] = snap[i].nodes_made - snap[i].nodes_seen;
 
     const unsigned min = atomic_exchange(&g_dt_min, 0), max = atomic_exchange(&g_dt_max, 0);
-    char tail[256];
+    const unsigned frames = atomic_exchange(&g_frames, 0);
+    char frames_text[16] = "?", tail[288];
+    if (atomic_load(&g_ticking)) snprintf(frames_text, sizeof(frames_text), "%u", frames);
     snprintf(tail, sizeof(tail),
-             " dt=%.4f dtmin=%.4f dtmax=%.4f dt_any=%.4f updates=%u frames=%u total=%d untracked=%u suppressed=%u",
+             " dt=%.4f dtmin=%.4f dtmax=%.4f dt_any=%.4f updates=%u frames=%s total=%d untracked=%u suppressed=%u",
              as_float(atomic_load(&g_dt_last)), as_float(min), as_float(max), as_float(atomic_load(&g_dt_any)),
-             atomic_exchange(&g_updates, 0), atomic_exchange(&g_frames, 0), total, atomic_load(&g_untracked),
+             atomic_exchange(&g_updates, 0), frames_text, walk.total, atomic_load(&g_untracked),
              atomic_exchange(&g_suppressed, 0));
-    atomic_store(&g_events, 0);
 
     static char line[4096];
     if (g_all) {
-        size_t used = append(line, sizeof(line), 0, "FX: second all live=%d top=[", n);
+        size_t used = append(line, sizeof(line), 0, "FX: second all live=%d nodes=%d", n, walk.nodes);
+        used = append_top(line, sizeof(line), used, "top_live", counts, SLOTS, 0);
+        used = append_top(line, sizeof(line), used, "top_nodes", counts, SLOTS, 1);
+        used = append(line, sizeof(line), used, " biggest=%d:%d@0x%llx", walk.biggest_id, walk.biggest_nodes,
+                      (unsigned long long)walk.biggest);
+        used = append(line, sizeof(line), used, " top_created=[");
         for (int shown = 0; shown < TOP; ++shown) {
             int best = -1;
-            for (int i = 0; i < SLOTS; ++i)
-                if (counts[i].n > 0 && (best < 0 || counts[i].n > counts[best].n)) best = i;
+            for (int i = 0; i < CHILD_SLOTS; ++i)
+                if (creations[i].n && (best < 0 || creations[i].n > creations[best].n)) best = i;
             if (best < 0) break;
-            used = append(line, sizeof(line), used, "%s%d:%d", shown ? "," : "", counts[best].id,
-                          counts[best].n);
-            counts[best].n = -counts[best].n;
+            used = append(line, sizeof(line), used, "%s%d:%u", shown ? "," : "", creations[best].id,
+                          creations[best].n);
+            creations[best].n = 0;
+        }
+        used = append(line, sizeof(line), used, "] top_child=[");
+        for (int shown = 0; shown < TOP; ++shown) {
+            int best = -1;
+            for (int i = 0; i < CHILD_SLOTS; ++i)
+                if (children[i].n && (best < 0 || children[i].n > children[best].n)) best = i;
+            if (best < 0) break;
+            used = append(line, sizeof(line), used, "%s%d:%u<%d", shown ? "," : "", children[best].id,
+                          children[best].n, children[best].parent_id);
+            children[best].n = 0;
         }
         append(line, sizeof(line), used, "]%s", tail);
         puts(line);
@@ -408,12 +526,23 @@ void bb_fx_trace_report(uint64_t list_head, uint64_t now) {
             if (count < SHOWN) mine[count] = snap[i], mine_made[count] = made[i];
             ++count;
         }
-        size_t used = append(line, sizeof(line), 0, "FX: second id=%d live=%d list=%d", id, count,
-                             list_count(counts, SLOTS, id));
+        uint32_t as_child = 0, spawned_in = 0, created = 0;
+        const ChildCount *c = count_slot(creations, id);
+        if (c) created = c->n;
+        int32_t child_in = 0;
+        for (int i = 0; i < CHILD_SLOTS; ++i) {
+            if (!children[i].n) continue;
+            if (children[i].id == id) as_child += children[i].n, child_in = children[i].parent_id;
+            if (children[i].parent_id == id) spawned_in += children[i].n;
+        }
+        size_t used = append(line, sizeof(line), 0, "FX: second id=%d live=%d list=%d created=%u", id, count,
+                             list_count(counts, SLOTS, id), created);
         const int shown = count < SHOWN ? count : SHOWN;
         for (int what = NODES; what <= AGE; ++what)
             used = append_list(line, sizeof(line), used, what, mine, shown, mine_made, now);
         if (count > SHOWN) used = append(line, sizeof(line), used, " more=%d", count - SHOWN);
+        used = append(line, sizeof(line), used, " child=%u child_in=%d children=%u", as_child, child_in,
+                      spawned_in);
         append(line, sizeof(line), used, "%s", tail);
         puts(line);
     }
@@ -438,14 +567,17 @@ static BB_GUEST_ABI void on_node(uint64_t system, uint64_t pos, uint64_t matrix,
     bb_fx_trace_node(instance);
 }
 
+static BB_GUEST_ABI void on_child(uint64_t system, int32_t id, uint64_t def, uint64_t a, uint64_t b,
+                                  uint64_t parent) {
+    (void)system, (void)def, (void)a, (void)b;
+    bb_fx_trace_child(id, parent);
+}
+
+/* Counts frames when the main-frame hook is there; the report does not depend on it. */
 static void tick(void) {
-    static uint64_t last;
+    atomic_store_explicit(&g_ticking, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_frames, 1, memory_order_relaxed);
-    const uint64_t now = now_us();
-    if (!last) last = now;
-    if (now - last < 1000000) return;
-    last = now;
-    bb_fx_trace_report((uint64_t)(uintptr_t)bb_guest(LIVE_LIST), now);
+    maybe_report();
 }
 
 int bb_fx_trace_install(void) {
@@ -456,7 +588,8 @@ int bb_fx_trace_install(void) {
         const BbCode *code;
     } const sites[] = {{CREATE_RETURN, &create_return_code}, {INSTANCE_STOP, &stop_code},
                        {INSTANCE_KILL, &kill_code},          {INSTANCE_RELEASE, &release_code},
-                       {INSTANCE_UPDATE, &update_code},      {NODE_CREATE, &node_create_code}};
+                       {INSTANCE_UPDATE, &update_code},      {NODE_CREATE, &node_create_code},
+                       {CHILD_EFFECT, &child_effect_code}};
     /* All or nothing: a half-installed trace would read as instances never stopped. */
     for (size_t i = 0; i < sizeof(sites) / sizeof(*sites); ++i)
         if (!bb_code_is(bb_guest(sites[i].at), *sites[i].code)) {
@@ -470,7 +603,8 @@ int bb_fx_trace_install(void) {
                       !bb_hook_mid(INSTANCE_KILL, kill_code, on_kill) +
                       !bb_hook_entry(INSTANCE_RELEASE, release_code, (void *)on_release) +
                       !bb_hook_entry(INSTANCE_UPDATE, update_code, (void *)on_update) +
-                      !bb_hook_entry(NODE_CREATE, node_create_code, (void *)on_node);
+                      !bb_hook_entry(NODE_CREATE, node_create_code, (void *)on_node) +
+                      !bb_hook_entry(CHILD_EFFECT, child_effect_code, (void *)on_child);
     if (hooks != (int)(sizeof(sites) / sizeof(*sites)))
         printf("FX trace: only %d of %d hooks went in (%s)\n", hooks, (int)(sizeof(sites) / sizeof(*sites)),
                bb_hooks_error());
