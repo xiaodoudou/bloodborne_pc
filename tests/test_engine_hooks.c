@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * engine_hooks.c on a small executable "image": an entry hook sees the arguments and leaves the
  * function's integer and vector arguments intact, a call-site hook replaces the callee and can
- * call the original, a mid-function hook sees and changes the registers while the flags, the
- * vector registers and the red zone survive it, a skippable site switches both ways, and all
- * refuse unexpected bytes without changing anything. */
+ * call the original, a mid-function hook sees and changes the registers (and finds the stack
+ * pointer) while the flags, the vector registers and the red zone survive it, a skippable site
+ * switches both ways, and all refuse unexpected bytes without changing anything. */
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -61,10 +61,11 @@ static const unsigned char mid_code[] = {
 static const unsigned char step_code[] = {0xb8, 0x01, 0x00, 0x00, 0x00, 0x05, 0x10, 0x00, 0x00, 0x00, 0xc3};
 typedef int32_t (BB_GUEST_ABI *StepFn)(void);
 
-static uint64_t seen_r13;
+static uint64_t seen_r13, seen_red;
 /* Changes the flags and the vector registers itself, and moves r13 on by 1000. */
 static BB_GUEST_ABI void on_mid(BbRegs *regs) {
     seen_r13 = regs->r13;
+    seen_red = *(const uint64_t *)(uintptr_t)(bb_regs_rsp(regs) - 8);  /* mid_code's [rsp-8] */
     regs->r13 += 1000;
     __asm__ volatile("vpxor %%ymm9, %%ymm9, %%ymm9\n\tcmp %%rsp, %%rsp" ::: "xmm9", "cc");
     ++entries;
@@ -125,7 +126,7 @@ int main(void) {
     assert(seen_a == 1 && seen_b == 2 && entries == 3);
     /* r13 seen as 3, then 1003; 3 < 5 kept in the flags; xmm9 and [rsp-8] intact. */
     assert(((IntFn)(image + MID))(3, 5) == 1003 + 5 + (1ll << 32) + 3 + 5);
-    assert(seen_r13 == 3 && entries == 4);
+    assert(seen_r13 == 3 && seen_red == 5 && entries == 4);
     assert(((IntFn)(image + MID))(9, 5) == 1009 + 5 + 9 + 5);
     assert(((StepFn)(image + STEP))() == 17);
     bb_skip(add16, 1);
