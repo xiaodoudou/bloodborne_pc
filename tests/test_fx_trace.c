@@ -18,7 +18,8 @@ typedef struct {
     _Alignas(16) unsigned char b[0x100];
 } Block;
 
-static Block inst[4], node[8], handle[3];
+static Block inst[4], node[8], handle[3], holder, owner;
+static uint64_t holder_vtable[8];
 static uint64_t frames[3][2];  /* saved frame pointer, return address */
 static uint64_t stop_return = 0x333;
 
@@ -82,7 +83,16 @@ int main(void) {
     put64(&handle[0], 0x18, at(&handle[1]));
     put64(&handle[1], 0x18, at(&handle[2]));
     assert(bb_fx_trace_handles(at(&inst[0]), 100) == 3);
-    assert(bb_fx_trace_handles(at(&inst[1]), 100) == 0);
+    /* inst[1] is kept by an sfx holder: vtable +0x20 is the holders' create method (image offset,
+     * with no image here), handle at +0x80, state +0x0c, flags +0x10, owner +0x18. */
+    holder_vtable[4] = 0x1f75680;
+    put64(&holder, 0, (uint64_t)(uintptr_t)holder_vtable);
+    put32(&holder, 0x0c, 1);
+    put32(&holder, 0x10, 0x1);
+    put64(&holder, 0x18, at(&owner));
+    put32(&owner, 0x20, 0x7f);
+    put64(&inst[1], 0x90, at(&holder) + 0x80);
+    assert(bb_fx_trace_handles(at(&inst[1]), 100) == 1);
     /* The library's live list: inst[0] -> inst[1] -> inst[2]. */
     put64(&inst[0], 0x70, at(&inst[1]));
     put64(&inst[1], 0x70, at(&inst[2]));
@@ -112,6 +122,18 @@ int main(void) {
     put32(&inst[0], 0x88, 3 | 8);  /* what the stop then sets */
     bb_fx_trace_flagged(at(&inst[0]), 0, (uint64_t)(uintptr_t)&stop_return, frame);
     bb_fx_trace_flagged(at(&inst[0]), 0, 0, 0);
+    /* External values: key 0 = 1.0 is the end request; others are logged a few times. */
+    uint32_t keys[2] = {0, 3}, values[2] = {0x3f800000, 0x3f000000}, other_key = 2;
+    Block set, other_set;
+    put64(&set, 0x08, (uint64_t)(uintptr_t)keys);
+    put64(&set, 0x10, (uint64_t)(uintptr_t)values);
+    put32(&set, 0x18, 2);
+    put64(&other_set, 0x08, (uint64_t)(uintptr_t)&other_key);
+    put64(&other_set, 0x10, (uint64_t)(uintptr_t)values);
+    put32(&other_set, 0x18, 1);
+    bb_fx_trace_externals(at(&inst[0]), at(&set), (uint64_t)(uintptr_t)&stop_return, frame);
+    bb_fx_trace_externals(at(&inst[1]), at(&other_set), 0, 0);
+    bb_fx_trace_externals(at(&inst[2]), at(&set), 0, 0);  /* not followed */
     bb_fx_trace_report(list, now_us() + 2000000);
     bb_fx_trace_destroyed(at(&inst[1]));
     bb_fx_trace_report(list, now_us());
@@ -157,15 +179,30 @@ int main(void) {
              (unsigned long long)at(&inst[0]), (unsigned long long)at(&node[1]));
     assert(strstr(text, want));
     assert(count_of(text, "FX: child ") == 1);
-    assert(strstr(text, "FX: second id=1251720 live=2 list=2 created=2 nodes=[5,0] new=[2,0] handles=[3,0] "
-                        "state=[stop,run] age=[2.0,2.0] child=1 child_in=1251720 children=2 dt=0.0111 "
+    snprintf(want, sizeof(want), "FX: terminate 1251720 inst=0x%llx age=0.00s set=[0:1,3:0.5] "
+             "from=0x333<0x111<0x222\n", (unsigned long long)at(&inst[0]));
+    assert(strstr(text, want));
+    snprintf(want, sizeof(want), "FX: externals 1251720 inst=0x%llx age=0.00s set=[2:1] from=?\n",
+             (unsigned long long)at(&inst[1]));
+    assert(strstr(text, want));
+    assert(count_of(text, "FX: terminate ") + count_of(text, "FX: externals ") == 2);
+    snprintf(want, sizeof(want), "FX: holder 1251720 inst=0x%llx holder=none\n", (unsigned long long)at(&inst[0]));
+    assert(strstr(text, want));
+    snprintf(want, sizeof(want), "FX: holder 1251720 inst=0x%llx holder=0x%llx vt=0x%llx state=1 flags=0x1 "
+             "owner=0x%llx owner_vt=0x0 h=[", (unsigned long long)at(&inst[1]), (unsigned long long)at(&holder),
+             (unsigned long long)(uintptr_t)holder_vtable, (unsigned long long)at(&owner));
+    assert(strstr(text, want));
+    assert(strstr(text, "] o=[0,0,0,0,0,0,0,0,7f,0,"));
+    assert(strstr(text, "FX: second id=1251721 live=0 "));  /* the default follows both ids */
+    assert(strstr(text, "FX: second id=1251720 live=2 list=2 created=2 nodes=[5,0] new=[2,0] handles=[3,1] "
+                        "state=[stop,run] hflags=[-,0x1] age=[2.0,2.0] child=1 child_in=1251720 children=2 dt=0.0111 "
                         "dtmin=0.0111 dtmax=0.0111 dt_any=0.5000 updates=3 frames=? total=3 untracked=0 "
                         "suppressed=0\n"));
     snprintf(want, sizeof(want), "FX: destroy 1251720 inst=0x%llx age=", (unsigned long long)at(&inst[1]));
     assert(strstr(text, want));
     assert(strstr(text, " stopped=0 killed=0 live=1\n"));
     assert(strstr(text, "FX: second id=1251720 live=1 list=2 created=0 nodes=[5] new=[0] handles=[3] "
-                        "state=[stop] "));
+                        "state=[stop] hflags=[-] "));
     assert(strstr(text, " child=0 child_in=0 children=0 "));
     assert(strstr(text, " updates=0 frames=? total=3 "));
     assert(count_of(text, "FX: create 42 ") == 2);
@@ -173,7 +210,8 @@ int main(void) {
              "top_nodes=[1251720:5/2] biggest=1251720:5@0x%llx top_created=[42:1] top_child=[42:1<42] ",
              (unsigned long long)at(&inst[0]));
     assert(strstr(text, want));
-    assert(strstr(text, "FX: second id=7 live=0 list=0 created=0 nodes=[] new=[] handles=[] state=[] age=[] "));
+    assert(strstr(text, "FX: second id=7 live=0 list=0 created=0 nodes=[] new=[] handles=[] state=[] hflags=[] "
+                        "age=[] "));
     assert(strstr(text, "FX: second id=42 live=1 list=1 created=1 nodes=[0] "));
     assert(!strstr(text, "FX: create 1251720 inst=0x0"));
     assert(count_of(text, "FX: create 1251720 ") == 2 + 40 + 1);

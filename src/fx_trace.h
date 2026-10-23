@@ -16,13 +16,15 @@ int bb_fx_trace_install(void);
 
 /* The trace's bookkeeping, called by its hooks; exposed for tests/test_fx_trace.c. */
 
-/* Effect ids to follow, from BB_FX_TRACE_ID: unset or empty for Ebrietas' trail (1251720),
- * "all", or a comma-separated list. */
+/* Effect ids to follow, from BB_FX_TRACE_ID: unset or empty for Ebrietas' rocks (1251721 and
+ * the 1251720 it wraps), "all", or a comma-separated list. */
 void bb_fx_trace_select(const char *ids);
 /* An instance the library just created; `frame` is the creating function's frame pointer. */
 void bb_fx_trace_created(uint64_t instance, uint64_t frame);
 /* Stop (kill = 0) or kill (kill = 1) requested at an instance-flag function's entry. */
 void bb_fx_trace_flagged(uint64_t instance, int kill, uint64_t rsp, uint64_t frame);
+/* External values set on an instance (key 0 = 1.0 asks it to end), at the setter's entry. */
+void bb_fx_trace_externals(uint64_t instance, uint64_t set, uint64_t rsp, uint64_t frame);
 /* An instance the library's collector is about to free. */
 void bb_fx_trace_destroyed(uint64_t instance);
 /* An instance's update with the frame time it receives. */

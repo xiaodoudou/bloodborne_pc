@@ -16,6 +16,10 @@
  * no new instance), so an effect can live only as nodes of another; the node count stands in for
  * the particle count.
  *
+ * A forever-emitting instance ends only when its external value key 0 ("terminate") is set to
+ * 1.0 (sub_28505f0): the game's sfx holder (vtable +0x20 = sub_1f75680, handle at +0x80) does it
+ * in its update (sub_1f73850) once its flag bit 0 (end requested, +0x10) is set.
+ *
  * The once-a-second report runs from whichever hook first sees the second end: the main-frame
  * tick is not there when another patch took that function's entry (Atlas lamp travel does).
  *
@@ -40,6 +44,8 @@ enum {
     INSTANCE_UPDATE = 0x284ff30,  /* (instance, context, float dt) */
     NODE_CREATE = 0x284daa0,      /* (system, pos, matrix, def, instance, parent, ...) */
     CHILD_EFFECT = 0x2853560,     /* (system, effect id, def, ?, ?, parent node, ...) */
+    INSTANCE_EXTERNALS = 0x28505f0, /* (instance, external value set): key 0 = 1.0 ends it */
+    HOLDER_CREATE = 0x1f75680,    /* SprjFD4 sfx holder vtable +0x20; keeps the handle at +0x80 */
     LIVE_LIST = 0x54b0000,
 };
 static const BbCode create_return_code = {6, 0x08d07dc40feaa530ull};
@@ -49,10 +55,18 @@ static const BbCode release_code = {15, 0x112fb6ddc4b7e884ull};
 static const BbCode update_code = {20, 0xc56331ff3adcd756ull};
 static const BbCode node_create_code = {21, 0x8e1c12827986e080ull};
 static const BbCode child_effect_code = {20, 0x60b885ecf8e57f6bull};
+static const BbCode externals_code = {6, 0x82d75a35aabe38aaull};
 
 enum { INST_ID = 0x00, INST_NEXT = 0x70, INST_ROOT = 0x78, INST_FLAGS = 0x88, INST_HANDLES = 0x90 };
 enum { NODE_INSTANCE = 0x58, HANDLE_NEXT = 0x18, FLAG_KILL = 4, FLAG_STOP = 8 };
-enum { DEFAULT_ID = 1251720, MAX_IDS = 16, MAX_TRACKED = 1024, SHOWN = 24, TOP = 8, CHILD_SLOTS = 1024,
+/* Holder (game side): state +0x0c, flags +0x10 (bit 0 = end requested), owner +0x18. Value set:
+ * keys +0x08, values +0x10, count +0x18. */
+enum { HOLDER_HANDLE = 0x80, HOLDER_STATE = 0x0c, HOLDER_FLAGS = 0x10, HOLDER_OWNER = 0x18, HOLDER_DUMP = 0x80,
+       OWNER_DUMP = 0x80, HOLDERS_SHOWN = 3, SET_KEYS = 0x08, SET_VALUES = 0x10, SET_COUNT = 0x18, SET_SHOWN = 8,
+       EXTERNALS_LOGGED = 4 };
+/* Ebrietas' rock effect (1251721) and the trail it wraps. */
+static const int32_t DEFAULT_IDS[] = {1251721, 1251720};
+enum { MAX_IDS = 16, MAX_TRACKED = 1024, SHOWN = 24, TOP = 8, CHILD_SLOTS = 1024,
        EVENT_BUDGET = 40, DEPTH = 6, NODE_CAP = 100000, LIST_CAP = 200000, ALL_NODES_CAP = 400000,
        CODE_END = 0x4000000 };
 static const uint64_t SECOND = 1000000;
@@ -69,7 +83,7 @@ typedef struct {
     uint64_t instance, created_us;
     int32_t id;
     uint32_t nodes_made, nodes_seen;
-    int stopped, killed;
+    int stopped, killed, externals;
 } Tracked;
 
 static int32_t g_ids[MAX_IDS];
@@ -102,6 +116,17 @@ static uint64_t read64(uint64_t address) {
     return bb_read(address, &v, 8) ? v : 0;
 }
 
+static float as_float(unsigned bits) {
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+static unsigned float_bits(float f) {
+    unsigned bits;
+    memcpy(&bits, &f, 4);
+    return bits;
+}
+
 /* The hooks see instances the game is using right then, so they read them directly. */
 static int read_id(uint64_t instance, int32_t *id) {
     if (!instance) return 0;
@@ -130,7 +155,9 @@ void bb_fx_trace_select(const char *ids) {
             p = *end == ',' ? end + 1 : end;
         }
     }
-    if (!g_all && !g_id_count) g_ids[g_id_count++] = DEFAULT_ID;
+    if (!g_all && !g_id_count)
+        while (g_id_count < (int)(sizeof(DEFAULT_IDS) / sizeof(*DEFAULT_IDS)))
+            g_ids[g_id_count] = DEFAULT_IDS[g_id_count], ++g_id_count;
     lock();
     g_count = 0;
     memset(g_children, 0, sizeof(g_children));
@@ -246,6 +273,35 @@ void bb_fx_trace_flagged(uint64_t instance, int kill, uint64_t rsp, uint64_t fra
     fflush(stdout);
 }
 
+void bb_fx_trace_externals(uint64_t instance, uint64_t set, uint64_t rsp, uint64_t frame) {
+    int32_t id;
+    if (!read_id(instance, &id) || !followed(id)) return;
+    uint32_t count = 0, keys[SET_SHOWN], values[SET_SHOWN];
+    uint64_t key_at = 0, value_at = 0;
+    if (!set || !bb_read(set + SET_COUNT, &count, 4) || !bb_read(set + SET_KEYS, &key_at, 8) ||
+        !bb_read(set + SET_VALUES, &value_at, 8))
+        count = 0;
+    const uint32_t shown = count < SET_SHOWN ? count : SET_SHOWN;
+    if (shown && (!bb_read(key_at, keys, 4 * shown) || !bb_read(value_at, values, 4 * shown))) count = 0;
+    int terminate = 0;
+    for (uint32_t i = 0; i < shown && count; ++i) terminate |= keys[i] == 0 && as_float(values[i]) == 1.0f;
+    lock();
+    Tracked *t = find(instance);
+    const uint64_t created = t ? t->created_us : 0;
+    const int seen = t ? t->externals++ : 0;
+    unlock();
+    if ((!terminate && (seen >= EXTERNALS_LOGGED || !count)) || !may_log()) return;
+    char from[200], age[32] = "?", values_text[160] = "";
+    format_from(from, sizeof(from), rsp ? read64(rsp) : 0, frame);
+    if (created) snprintf(age, sizeof(age), "%.2fs", (double)(now_us() - created) / 1e6);
+    size_t used = 0;
+    for (uint32_t i = 0; i < shown && count; ++i)
+        used = append(values_text, sizeof(values_text), used, "%s%u:%g", i ? "," : "", keys[i], as_float(values[i]));
+    printf("FX: %s %d inst=0x%llx age=%s set=[%s]%s%s\n", terminate ? "terminate" : "externals", id,
+           (unsigned long long)instance, age, values_text, count > SET_SHOWN ? ",..." : "", from);
+    fflush(stdout);
+}
+
 void bb_fx_trace_destroyed(uint64_t instance) {
     int32_t id;
     if (!read_id(instance, &id) || !followed(id)) return;
@@ -263,16 +319,6 @@ void bb_fx_trace_destroyed(uint64_t instance) {
     fflush(stdout);
 }
 
-static float as_float(unsigned bits) {
-    float f;
-    memcpy(&f, &bits, 4);
-    return f;
-}
-static unsigned float_bits(float f) {
-    unsigned bits;
-    memcpy(&bits, &f, 4);
-    return bits;
-}
 
 /* Keeps the smaller (want_min) or larger value of `slot` and `dt`; 0 bits means unset. */
 static void keep_extreme(atomic_uint *slot, float dt, int want_min) {
@@ -425,10 +471,21 @@ static size_t append(char *out, size_t size, size_t used, const char *format, ..
 }
 
 /* One "name=[a,b,...]" list over the instances shown. */
-enum { NODES, NEW, HANDLES, STATE, AGE };
+/* The sfx holder keeping a handle to `instance`, recognised by its vtable's create method. */
+static uint64_t holder_of(uint64_t instance) {
+    const uint64_t create = (uint64_t)(uintptr_t)bb_guest(0) + HOLDER_CREATE;
+    int n = 0;
+    for (uint64_t h = read64(instance + INST_HANDLES); h && n < NODE_CAP; h = read64(h + HANDLE_NEXT), ++n) {
+        const uint64_t holder = h - HOLDER_HANDLE, vtable = read64(holder);
+        if (vtable && read64(vtable + 0x20) == create) return holder;
+    }
+    return 0;
+}
+
+enum { NODES, NEW, HANDLES, STATE, HOLDER, AGE };
 static size_t append_list(char *out, size_t size, size_t used, int what, const Tracked *t, int n,
                           const uint32_t *made, uint64_t now) {
-    static const char *const names[] = {"nodes", "new", "handles", "state", "age"};
+    static const char *const names[] = {"nodes", "new", "handles", "state", "hflags", "age"};
     used = append(out, size, used, " %s=[", names[what]);
     for (int i = 0; i < n; ++i) {
         const char *sep = i ? "," : "";
@@ -447,10 +504,48 @@ static size_t append_list(char *out, size_t size, size_t used, int what, const T
             used = append(out, size, used, "%s%s", sep, state);
             break;
         }
+        case HOLDER: {
+            const uint64_t holder = holder_of(t[i].instance);
+            used = holder && bb_read(holder + HOLDER_FLAGS, &flags, 4)
+                       ? append(out, size, used, "%s0x%x", sep, flags & 0xff)
+                       : append(out, size, used, "%s-", sep);
+            break;
+        }
         case AGE: used = append(out, size, used, "%s%.1f", sep, (double)(now - t[i].created_us) / 1e6); break;
         }
     }
     return append(out, size, used, "]");
+}
+
+/* " name=[a,b,...]": `bytes` of dwords at `at`, in hex. */
+static size_t append_dwords(char *out, size_t size, size_t used, const char *name, uint64_t at, int bytes) {
+    uint32_t words[64];
+    used = append(out, size, used, " %s=[", name);
+    if (at && bytes <= (int)sizeof(words) && bb_read(at, words, (size_t)bytes))
+        for (int i = 0; i < bytes / 4; ++i) used = append(out, size, used, "%s%x", i ? "," : "", words[i]);
+    return append(out, size, used, "]");
+}
+
+/* The holder of a followed instance, its owner and their first fields (to spot an end timer). */
+static void print_holder(int32_t id, uint64_t instance) {
+    static char text[2048];
+    const uint64_t holder = holder_of(instance);
+    if (!holder) {
+        printf("FX: holder %d inst=0x%llx holder=none\n", id, (unsigned long long)instance);
+        return;
+    }
+    uint32_t state = 0, flags = 0;
+    bb_read(holder + HOLDER_STATE, &state, 4);
+    bb_read(holder + HOLDER_FLAGS, &flags, 4);
+    const uint64_t owner = read64(holder + HOLDER_OWNER);
+    size_t used = append(text, sizeof(text), 0,
+                         "FX: holder %d inst=0x%llx holder=0x%llx vt=0x%llx state=%u flags=0x%x owner=0x%llx "
+                         "owner_vt=0x%llx", id, (unsigned long long)instance, (unsigned long long)holder,
+                         (unsigned long long)code_offset(read64(holder)), state, flags & 0xff,
+                         (unsigned long long)owner, (unsigned long long)code_offset(read64(owner)));
+    used = append_dwords(text, sizeof(text), used, "h", holder, HOLDER_DUMP);
+    append_dwords(text, sizeof(text), used, "o", owner, OWNER_DUMP);
+    puts(text);
 }
 
 void bb_fx_trace_report(uint64_t list_head, uint64_t now) {
@@ -545,6 +640,7 @@ void bb_fx_trace_report(uint64_t list_head, uint64_t now) {
                       spawned_in);
         append(line, sizeof(line), used, "%s", tail);
         puts(line);
+        for (int i = 0; i < shown && i < HOLDERS_SHOWN; ++i) print_holder(id, mine[i].instance);
     }
     fflush(stdout);
 }
@@ -567,6 +663,9 @@ static BB_GUEST_ABI void on_node(uint64_t system, uint64_t pos, uint64_t matrix,
     bb_fx_trace_node(instance);
 }
 
+static BB_GUEST_ABI void on_externals(BbRegs *regs) {
+    bb_fx_trace_externals(regs->rdi, regs->rsi, bb_regs_rsp(regs), regs->rbp);
+}
 static BB_GUEST_ABI void on_child(uint64_t system, int32_t id, uint64_t def, uint64_t a, uint64_t b,
                                   uint64_t parent) {
     (void)system, (void)def, (void)a, (void)b;
@@ -589,7 +688,7 @@ int bb_fx_trace_install(void) {
     } const sites[] = {{CREATE_RETURN, &create_return_code}, {INSTANCE_STOP, &stop_code},
                        {INSTANCE_KILL, &kill_code},          {INSTANCE_RELEASE, &release_code},
                        {INSTANCE_UPDATE, &update_code},      {NODE_CREATE, &node_create_code},
-                       {CHILD_EFFECT, &child_effect_code}};
+                       {CHILD_EFFECT, &child_effect_code},   {INSTANCE_EXTERNALS, &externals_code}};
     /* All or nothing: a half-installed trace would read as instances never stopped. */
     for (size_t i = 0; i < sizeof(sites) / sizeof(*sites); ++i)
         if (!bb_code_is(bb_guest(sites[i].at), *sites[i].code)) {
@@ -604,7 +703,8 @@ int bb_fx_trace_install(void) {
                       !bb_hook_entry(INSTANCE_RELEASE, release_code, (void *)on_release) +
                       !bb_hook_entry(INSTANCE_UPDATE, update_code, (void *)on_update) +
                       !bb_hook_entry(NODE_CREATE, node_create_code, (void *)on_node) +
-                      !bb_hook_entry(CHILD_EFFECT, child_effect_code, (void *)on_child);
+                      !bb_hook_entry(CHILD_EFFECT, child_effect_code, (void *)on_child) +
+                      !bb_hook_mid(INSTANCE_EXTERNALS, externals_code, on_externals);
     if (hooks != (int)(sizeof(sites) / sizeof(*sites)))
         printf("FX trace: only %d of %d hooks went in (%s)\n", hooks, (int)(sizeof(sites) / sizeof(*sites)),
                bb_hooks_error());
