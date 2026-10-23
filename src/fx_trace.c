@@ -1,0 +1,484 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * Effect (SFX) instance trace (fx_trace.h), for Ebrietas' trail (f001251720.fxr) piling up rocks
+ * at high frame rates.
+ *
+ * The effect library (Dantelion2 FFX) keeps each effect instance in a 0x98-byte block from
+ * sub_284fc70, made only by sub_2853020 (system, id, ...), which the FX system's vtable entry
+ * sub_28eb7f0 wraps in a handle. The instance holds its effect id at +0, a time scale at +8, its
+ * tree of effect nodes at +0x78 (0x100-byte nodes from sub_284daa0: parent +0x60, next sibling
+ * +0x68, first child +0x70), flags at +0x88 and the handles referring to it at +0x90 (linked at
+ * handle +0x18). Every live instance is on one list (head at 0x54b0000, linked at +0x70).
+ *
+ * Stop (sub_2850780) sets flag 8, which the root nodes' state machine reads to end. Kill
+ * (sub_284ff20) sets flag 4: the next update (sub_284ff30, with the frame time in xmm0) frees the
+ * whole tree. Once an instance has no nodes left, the collector (sub_2850d30) releases it
+ * (sub_284fd50) and frees it. Emitters add child nodes (sub_2853560), so the node count stands in
+ * for the particle count.
+ *
+ * Only reads: the hooks run before the game's own instructions and change no register or memory.
+ *
+ * Addresses are image offsets (eboot virtual address; Binary Ninja's minus 0x400000). */
+#include "fx_trace.h"
+#include "engine_hooks.h"
+
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+enum {
+    CREATE_RETURN = 0x28eb813,    /* sub_28eb7f0, right after call sub_2853020: rax = instance */
+    INSTANCE_STOP = 0x2850780,    /* or byte [rdi+0x88], 8 */
+    INSTANCE_KILL = 0x284ff20,    /* or byte [rdi+0x88], 4 */
+    INSTANCE_RELEASE = 0x284fd50, /* (instance), from the collector before the free */
+    INSTANCE_UPDATE = 0x284ff30,  /* (instance, context, float dt) */
+    NODE_CREATE = 0x284daa0,      /* (system, pos, matrix, def, instance, parent, ...) */
+    LIVE_LIST = 0x54b0000,
+};
+static const BbCode create_return_code = {6, 0x08d07dc40feaa530ull};
+static const BbCode stop_code = {7, 0x3c13c04b3a59ce50ull};
+static const BbCode kill_code = {7, 0x3c13cc4b3a59e2b4ull};
+static const BbCode release_code = {15, 0x112fb6ddc4b7e884ull};
+static const BbCode update_code = {20, 0xc56331ff3adcd756ull};
+static const BbCode node_create_code = {21, 0x8e1c12827986e080ull};
+
+enum { INST_ID = 0x00, INST_NEXT = 0x70, INST_ROOT = 0x78, INST_FLAGS = 0x88, INST_HANDLES = 0x90 };
+enum { NODE_INSTANCE = 0x58, HANDLE_NEXT = 0x18, FLAG_KILL = 4, FLAG_STOP = 8 };
+enum { DEFAULT_ID = 1251720, MAX_IDS = 16, MAX_TRACKED = 1024, SHOWN = 24, TOP = 8,
+       EVENT_BUDGET = 40, DEPTH = 4, NODE_CAP = 100000, LIST_CAP = 200000, CODE_END = 0x4000000 };
+
+typedef struct {
+    uint64_t instance, created_us;
+    int32_t id;
+    uint32_t nodes_made, nodes_seen;
+    int stopped, killed;
+} Tracked;
+
+static int32_t g_ids[MAX_IDS];
+static int g_id_count, g_all;
+static Tracked g_tracked[MAX_TRACKED];
+static int g_count;
+static atomic_uint g_untracked, g_events, g_suppressed, g_updates, g_frames;
+static atomic_uint g_dt_last, g_dt_min, g_dt_max, g_dt_any;  /* float bits */
+static atomic_flag g_lock = ATOMIC_FLAG_INIT;
+
+static void lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_lock, memory_order_acquire)) __builtin_ia32_pause();
+}
+static void unlock(void) { atomic_flag_clear_explicit(&g_lock, memory_order_release); }
+
+static uint64_t now_us(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
+
+static uint64_t read64(uint64_t address) {
+    uint64_t v = 0;
+    return bb_read(address, &v, 8) ? v : 0;
+}
+
+/* The hooks see instances the game is using right then, so they read them directly. */
+static int read_id(uint64_t instance, int32_t *id) {
+    if (!instance) return 0;
+    memcpy(id, (const void *)(uintptr_t)(instance + INST_ID), 4);
+    return 1;
+}
+
+static int followed(int32_t id) {
+    if (g_all) return 1;
+    for (int i = 0; i < g_id_count; ++i)
+        if (g_ids[i] == id) return 1;
+    return 0;
+}
+
+void bb_fx_trace_select(const char *ids) {
+    g_all = 0;
+    g_id_count = 0;
+    if (ids && !strcmp(ids, "all")) {
+        g_all = 1;
+    } else if (ids && *ids) {
+        for (const char *p = ids; *p && g_id_count < MAX_IDS;) {
+            char *end;
+            const long id = strtol(p, &end, 10);
+            if (end == p) break;
+            g_ids[g_id_count++] = (int32_t)id;
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
+    if (!g_all && !g_id_count) g_ids[g_id_count++] = DEFAULT_ID;
+    lock();
+    g_count = 0;
+    unlock();
+    atomic_store(&g_untracked, 0);
+    atomic_store(&g_events, 0);
+    atomic_store(&g_suppressed, 0);
+    atomic_store(&g_updates, 0);
+    atomic_store(&g_frames, 0);
+    atomic_store(&g_dt_last, 0);
+    atomic_store(&g_dt_any, 0);
+}
+
+static Tracked *find(uint64_t instance) {
+    for (int i = 0; i < g_count; ++i)
+        if (g_tracked[i].instance == instance) return &g_tracked[i];
+    return NULL;
+}
+
+static int live_of(int32_t id) {
+    int n = 0;
+    for (int i = 0; i < g_count; ++i) n += g_tracked[i].id == id;
+    return n;
+}
+
+/* Lines beyond the per-second budget are counted in the next report instead. */
+static int may_log(void) {
+    if (atomic_fetch_add(&g_events, 1) < EVENT_BUDGET) return 1;
+    atomic_fetch_add(&g_suppressed, 1);
+    return 0;
+}
+
+static uint64_t code_offset(uint64_t address) {
+    const uint64_t base = (uint64_t)(uintptr_t)bb_guest(0);
+    if (!base) return address;
+    return address > base && address - base < CODE_END ? address - base : 0;
+}
+
+/* " from=a<b<c": the return address `first` (when known), then the frame pointer chain. */
+static void format_from(char *out, size_t size, uint64_t first, uint64_t frame) {
+    size_t used = (size_t)snprintf(out, size, " from=");
+    int shown = 0;
+    if (first && code_offset(first))
+        used += (size_t)snprintf(out + used, size - used, "0x%llx", (unsigned long long)code_offset(first)),
+            ++shown;
+    for (int i = 0; i < DEPTH && frame && used < size; ++i) {
+        const uint64_t ret = code_offset(read64(frame + 8));
+        if (!ret) break;
+        used += (size_t)snprintf(out + used, size - used, "%s0x%llx", shown++ ? "<" : "", (unsigned long long)ret);
+        frame = read64(frame);
+    }
+    if (!shown) snprintf(out, size, " from=?");
+}
+
+void bb_fx_trace_created(uint64_t instance, uint64_t frame) {
+    int32_t id;
+    if (!read_id(instance, &id) || !followed(id)) return;
+    lock();
+    if (!find(instance)) {
+        if (g_count < MAX_TRACKED)
+            g_tracked[g_count++] = (Tracked){.instance = instance, .created_us = now_us(), .id = id};
+        else
+            atomic_fetch_add(&g_untracked, 1);
+    }
+    const int live = live_of(id);
+    unlock();
+    if (!may_log()) return;
+    char from[160];
+    format_from(from, sizeof(from), 0, frame);
+    printf("FX: create %d inst=0x%llx live=%d%s\n", id, (unsigned long long)instance, live, from);
+    fflush(stdout);
+}
+
+void bb_fx_trace_flagged(uint64_t instance, int kill, uint64_t rsp, uint64_t frame) {
+    int32_t id;
+    if (!read_id(instance, &id) || !followed(id)) return;
+    lock();
+    Tracked *t = find(instance);
+    const uint64_t created = t ? t->created_us : 0;
+    int again = 0;
+    if (t) {
+        int *flag = kill ? &t->killed : &t->stopped;
+        again = (*flag)++ > 0;
+    }
+    const int live = live_of(id);
+    unlock();
+    if (!may_log()) return;
+    char from[160], age[32] = "?";
+    format_from(from, sizeof(from), rsp ? read64(rsp) : 0, frame);
+    if (created) snprintf(age, sizeof(age), "%.2fs", (double)(now_us() - created) / 1e6);
+    printf("FX: %s %d inst=0x%llx age=%s nodes=%d handles=%d live=%d%s%s\n", kill ? "kill" : "stop", id,
+           (unsigned long long)instance, age, bb_fx_trace_nodes(instance, NODE_CAP),
+           bb_fx_trace_handles(instance, NODE_CAP), live, again ? " again" : "", from);
+    fflush(stdout);
+}
+
+void bb_fx_trace_destroyed(uint64_t instance) {
+    int32_t id;
+    if (!read_id(instance, &id) || !followed(id)) return;
+    lock();
+    Tracked *t = find(instance);
+    const Tracked gone = t ? *t : (Tracked){0};
+    if (t) *t = g_tracked[--g_count];
+    const int live = live_of(id);
+    unlock();
+    if (!may_log()) return;
+    char age[32] = "?";
+    if (gone.created_us) snprintf(age, sizeof(age), "%.2fs", (double)(now_us() - gone.created_us) / 1e6);
+    printf("FX: destroy %d inst=0x%llx age=%s stopped=%d killed=%d live=%d\n", id,
+           (unsigned long long)instance, age, gone.stopped, gone.killed, live);
+    fflush(stdout);
+}
+
+static float as_float(unsigned bits) {
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+static unsigned float_bits(float f) {
+    unsigned bits;
+    memcpy(&bits, &f, 4);
+    return bits;
+}
+
+/* Keeps the smaller (want_min) or larger value of `slot` and `dt`; 0 bits means unset. */
+static void keep_extreme(atomic_uint *slot, float dt, int want_min) {
+    unsigned seen = atomic_load(slot);
+    while (!seen || (want_min ? dt < as_float(seen) : dt > as_float(seen)))
+        if (atomic_compare_exchange_weak(slot, &seen, float_bits(dt))) break;
+}
+
+void bb_fx_trace_updated(uint64_t instance, float dt) {
+    atomic_store_explicit(&g_dt_any, float_bits(dt), memory_order_relaxed);
+    int32_t id;
+    if (!read_id(instance, &id) || !followed(id)) return;
+    atomic_fetch_add_explicit(&g_updates, 1, memory_order_relaxed);
+    atomic_store_explicit(&g_dt_last, float_bits(dt), memory_order_relaxed);
+    keep_extreme(&g_dt_min, dt, 1);
+    keep_extreme(&g_dt_max, dt, 0);
+}
+
+void bb_fx_trace_node(uint64_t instance) {
+    int32_t id;
+    if (!read_id(instance, &id) || !followed(id)) return;
+    lock();
+    Tracked *t = find(instance);
+    if (t) ++t->nodes_made;
+    unlock();
+}
+
+int bb_fx_trace_nodes(uint64_t instance, int cap) {
+    int n = 0;
+    uint64_t node = read64(instance + INST_ROOT);
+    /* The library's own walk (sub_284f0e0): first child, else next sibling, else up. */
+    while (node && n < cap) {
+        uint64_t links[4];  /* instance, parent, sibling, child */
+        if (!bb_read(node + NODE_INSTANCE, links, sizeof(links)) || links[0] != instance) break;
+        ++n;
+        if (links[3]) {
+            node = links[3];
+            continue;
+        }
+        while (!links[2] && links[1] && bb_read(links[1] + NODE_INSTANCE, links, sizeof(links))) {}
+        node = links[2];
+    }
+    return n;
+}
+
+int bb_fx_trace_handles(uint64_t instance, int cap) {
+    int n = 0;
+    for (uint64_t h = read64(instance + INST_HANDLES); h && n < cap; h = read64(h + HANDLE_NEXT)) ++n;
+    return n;
+}
+
+typedef struct {
+    int32_t id;
+    int n;
+} IdCount;
+
+/* Counts the library's live instances, per followed id (or per id, for "all"). */
+static int walk_live(uint64_t list_head, IdCount *counts, int slots) {
+    int total = 0;
+    for (uint64_t inst = read64(list_head); inst && total < LIST_CAP; inst = read64(inst + INST_NEXT)) {
+        ++total;
+        int32_t id;
+        if (!bb_read(inst + INST_ID, &id, 4) || !followed(id)) continue;
+        for (int i = (int)((uint32_t)id * 2654435761u % (uint32_t)slots), probes = 0; probes < slots;
+             i = (i + 1) % slots, ++probes) {
+            if (counts[i].n && counts[i].id != id) continue;
+            counts[i].id = id;
+            ++counts[i].n;
+            break;
+        }
+    }
+    return total;
+}
+
+static int list_count(const IdCount *counts, int slots, int32_t id) {
+    for (int i = 0; i < slots; ++i)
+        if (counts[i].n && counts[i].id == id) return counts[i].n;
+    return 0;
+}
+
+static int by_age(const void *a, const void *b) {
+    const uint64_t x = ((const Tracked *)a)->created_us, y = ((const Tracked *)b)->created_us;
+    return x < y ? -1 : x > y;
+}
+
+static size_t append(char *out, size_t size, size_t used, const char *format, ...)
+    __attribute__((format(printf, 4, 5)));
+static size_t append(char *out, size_t size, size_t used, const char *format, ...) {
+    if (used >= size) return used;
+    va_list args;
+    va_start(args, format);
+    const int n = vsnprintf(out + used, size - used, format, args);
+    va_end(args);
+    return n < 0 ? used : used + (size_t)n;
+}
+
+/* One "name=[a,b,...]" list over the instances shown. */
+enum { NODES, NEW, HANDLES, STATE, AGE };
+static size_t append_list(char *out, size_t size, size_t used, int what, const Tracked *t, int n,
+                          const uint32_t *made, uint64_t now) {
+    static const char *const names[] = {"nodes", "new", "handles", "state", "age"};
+    used = append(out, size, used, " %s=[", names[what]);
+    for (int i = 0; i < n; ++i) {
+        const char *sep = i ? "," : "";
+        uint32_t flags = 0;
+        switch (what) {
+        case NODES: used = append(out, size, used, "%s%d", sep, bb_fx_trace_nodes(t[i].instance, NODE_CAP)); break;
+        case NEW: used = append(out, size, used, "%s%u", sep, made[i]); break;
+        case HANDLES:
+            used = append(out, size, used, "%s%d", sep, bb_fx_trace_handles(t[i].instance, NODE_CAP));
+            break;
+        case STATE: {
+            const char *state = !bb_read(t[i].instance + INST_FLAGS, &flags, 4) ? "?"
+                                : flags & FLAG_KILL ? "kill"
+                                : flags & FLAG_STOP ? "stop"
+                                : "run";
+            used = append(out, size, used, "%s%s", sep, state);
+            break;
+        }
+        case AGE: used = append(out, size, used, "%s%.1f", sep, (double)(now - t[i].created_us) / 1e6); break;
+        }
+    }
+    return append(out, size, used, "]");
+}
+
+void bb_fx_trace_report(uint64_t list_head, uint64_t now) {
+    static Tracked snap[MAX_TRACKED];
+    static uint32_t made[MAX_TRACKED];
+    static IdCount counts[2048];
+    enum { SLOTS = sizeof(counts) / sizeof(*counts) };
+    memset(counts, 0, sizeof(counts));
+    const int total = walk_live(list_head, counts, SLOTS);
+
+    lock();
+    const int n = g_count;
+    for (int i = 0; i < n; ++i) {
+        snap[i] = g_tracked[i];
+        g_tracked[i].nodes_seen = g_tracked[i].nodes_made;
+    }
+    unlock();
+    qsort(snap, (size_t)n, sizeof(*snap), by_age);
+    for (int i = 0; i < n; ++i) made[i] = snap[i].nodes_made - snap[i].nodes_seen;
+
+    const unsigned min = atomic_exchange(&g_dt_min, 0), max = atomic_exchange(&g_dt_max, 0);
+    char tail[256];
+    snprintf(tail, sizeof(tail),
+             " dt=%.4f dtmin=%.4f dtmax=%.4f dt_any=%.4f updates=%u frames=%u total=%d untracked=%u suppressed=%u",
+             as_float(atomic_load(&g_dt_last)), as_float(min), as_float(max), as_float(atomic_load(&g_dt_any)),
+             atomic_exchange(&g_updates, 0), atomic_exchange(&g_frames, 0), total, atomic_load(&g_untracked),
+             atomic_exchange(&g_suppressed, 0));
+    atomic_store(&g_events, 0);
+
+    static char line[4096];
+    if (g_all) {
+        size_t used = append(line, sizeof(line), 0, "FX: second all live=%d top=[", n);
+        for (int shown = 0; shown < TOP; ++shown) {
+            int best = -1;
+            for (int i = 0; i < SLOTS; ++i)
+                if (counts[i].n > 0 && (best < 0 || counts[i].n > counts[best].n)) best = i;
+            if (best < 0) break;
+            used = append(line, sizeof(line), used, "%s%d:%d", shown ? "," : "", counts[best].id,
+                          counts[best].n);
+            counts[best].n = -counts[best].n;
+        }
+        append(line, sizeof(line), used, "]%s", tail);
+        puts(line);
+    }
+    for (int k = 0; !g_all && k < g_id_count; ++k) {
+        const int32_t id = g_ids[k];
+        Tracked mine[SHOWN];
+        uint32_t mine_made[SHOWN];
+        int count = 0;
+        for (int i = 0; i < n; ++i) {
+            if (snap[i].id != id) continue;
+            if (count < SHOWN) mine[count] = snap[i], mine_made[count] = made[i];
+            ++count;
+        }
+        size_t used = append(line, sizeof(line), 0, "FX: second id=%d live=%d list=%d", id, count,
+                             list_count(counts, SLOTS, id));
+        const int shown = count < SHOWN ? count : SHOWN;
+        for (int what = NODES; what <= AGE; ++what)
+            used = append_list(line, sizeof(line), used, what, mine, shown, mine_made, now);
+        if (count > SHOWN) used = append(line, sizeof(line), used, " more=%d", count - SHOWN);
+        append(line, sizeof(line), used, "%s", tail);
+        puts(line);
+    }
+    fflush(stdout);
+}
+
+static BB_GUEST_ABI void on_create_return(BbRegs *regs) { bb_fx_trace_created(regs->rax, regs->rbp); }
+static BB_GUEST_ABI void on_stop(BbRegs *regs) {
+    bb_fx_trace_flagged(regs->rdi, 0, bb_regs_rsp(regs), regs->rbp);
+}
+static BB_GUEST_ABI void on_kill(BbRegs *regs) {
+    bb_fx_trace_flagged(regs->rdi, 1, bb_regs_rsp(regs), regs->rbp);
+}
+static BB_GUEST_ABI void on_release(uint64_t instance) { bb_fx_trace_destroyed(instance); }
+static BB_GUEST_ABI void on_update(uint64_t instance, uint64_t context, float dt) {
+    (void)context;
+    bb_fx_trace_updated(instance, dt);
+}
+static BB_GUEST_ABI void on_node(uint64_t system, uint64_t pos, uint64_t matrix, uint64_t def,
+                                 uint64_t instance) {
+    (void)system, (void)pos, (void)matrix, (void)def;
+    bb_fx_trace_node(instance);
+}
+
+static void tick(void) {
+    static uint64_t last;
+    atomic_fetch_add_explicit(&g_frames, 1, memory_order_relaxed);
+    const uint64_t now = now_us();
+    if (!last) last = now;
+    if (now - last < 1000000) return;
+    last = now;
+    bb_fx_trace_report((uint64_t)(uintptr_t)bb_guest(LIVE_LIST), now);
+}
+
+int bb_fx_trace_install(void) {
+    const char *env = getenv("BB_FX_TRACE");
+    if (!env || strcmp(env, "1")) return 0;
+    struct {
+        uint64_t at;
+        const BbCode *code;
+    } const sites[] = {{CREATE_RETURN, &create_return_code}, {INSTANCE_STOP, &stop_code},
+                       {INSTANCE_KILL, &kill_code},          {INSTANCE_RELEASE, &release_code},
+                       {INSTANCE_UPDATE, &update_code},      {NODE_CREATE, &node_create_code}};
+    /* All or nothing: a half-installed trace would read as instances never stopped. */
+    for (size_t i = 0; i < sizeof(sites) / sizeof(*sites); ++i)
+        if (!bb_code_is(bb_guest(sites[i].at), *sites[i].code)) {
+            printf("FX trace: off - unexpected code at 0x%llx (not the 1.09 image?)\n",
+                   (unsigned long long)sites[i].at);
+            return 0;
+        }
+    bb_fx_trace_select(getenv("BB_FX_TRACE_ID"));
+    const int hooks = !bb_hook_mid(CREATE_RETURN, create_return_code, on_create_return) +
+                      !bb_hook_mid(INSTANCE_STOP, stop_code, on_stop) +
+                      !bb_hook_mid(INSTANCE_KILL, kill_code, on_kill) +
+                      !bb_hook_entry(INSTANCE_RELEASE, release_code, (void *)on_release) +
+                      !bb_hook_entry(INSTANCE_UPDATE, update_code, (void *)on_update) +
+                      !bb_hook_entry(NODE_CREATE, node_create_code, (void *)on_node);
+    if (hooks != (int)(sizeof(sites) / sizeof(*sites)))
+        printf("FX trace: only %d of %d hooks went in (%s)\n", hooks, (int)(sizeof(sites) / sizeof(*sites)),
+               bb_hooks_error());
+    bb_on_main_frame(tick);
+    printf("FX trace: on, %d hooks, following", hooks);
+    if (g_all) printf(" all effect ids");
+    for (int i = 0; i < g_id_count; ++i) printf(" %d", g_ids[i]);
+    putchar('\n');
+    fflush(stdout);
+    return hooks;
+}

@@ -276,6 +276,9 @@ int bb_hook_mid(uint64_t at, BbCode original, void (BB_GUEST_ABI *host)(BbRegs *
     return 0;
 }
 
+/* The stub saved the BbRegs just below the 0x80-byte red zone it stepped over. */
+uint64_t bb_regs_rsp(const BbRegs *regs) { return (uint64_t)(uintptr_t)(regs + 1) + 0x80; }
+
 struct BbSkip {
     const unsigned char *volatile target;  /* where the stub's indirect jump goes: run or skip */
     const unsigned char *run, *skip;
