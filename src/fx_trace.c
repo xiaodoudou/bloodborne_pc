@@ -20,6 +20,9 @@
  * 1.0 (sub_28505f0): the game's sfx holder (vtable +0x20 = sub_1f75680, handle at +0x80) does it
  * in its update (sub_1f73850) once its flag bit 0 (end requested, +0x10) is set.
  *
+ * Emitter nodes are logged each second from birth (two instances), and as they end: the end
+ * handler (sub_284ec70), the node update's phase writes and its four node-ending flag writes.
+ *
  * Nodes older than 5 s get a line with their lifecycle fields; their particle system (node +0xa0)
  * is watched by wrapping its class's vtable update (+0x18) and finished test (+0x38) in place:
  * the wrappers call the original first with the same arguments and return its result.
@@ -52,6 +55,9 @@ enum {
     NODE_CREATE = 0x284daa0,      /* (system, pos, matrix, def, instance, parent, ...) */
     CHILD_EFFECT = 0x2853560,     /* (system, effect id, def, ?, ?, parent node, ...) */
     INSTANCE_EXTERNALS = 0x28505f0, /* (instance, external value set): key 0 = 1.0 ends it */
+    NODE_END = 0x284ec70,         /* a node's end handler (node, ...): returns its next phase */
+    NODE_PHASE_A = 0x284e312,     /* node update: mov [r13+0xdc], eax (the new phase) */
+    NODE_PHASE_B = 0x284e37d,
     HOLDER_CREATE = 0x1f75680,    /* SprjFD4 sfx holder vtable +0x20; keeps the handle at +0x80 */
     LIVE_LIST = 0x54b0000,
 };
@@ -63,6 +69,11 @@ static const BbCode update_code = {20, 0xc56331ff3adcd756ull};
 static const BbCode node_create_code = {21, 0x8e1c12827986e080ull};
 static const BbCode child_effect_code = {20, 0x60b885ecf8e57f6bull};
 static const BbCode externals_code = {6, 0x82d75a35aabe38aaull};
+static const BbCode node_end_code = {8, 0x1354b67b76c500e5ull};
+static const BbCode node_phase_code = {7, 0x98985b92460ae012ull};
+/* The node update's four "end this node" writes (flags & ~5 | 4 at [r13+0x78]). */
+static const uint64_t NODE_KILLS[] = {0x284e0ca, 0x284e322, 0x284e45b, 0x284e4d8};
+static const BbCode node_kill_code = {7, 0x2166942f07eb4c9bull};
 
 enum { INST_ID = 0x00, INST_NEXT = 0x70, INST_ROOT = 0x78, INST_FLAGS = 0x88, INST_HANDLES = 0x90 };
 /* Node: definition +0x50, particle system +0xa0 (body +0x20); FXR: root node at +0x30. */
@@ -70,6 +81,10 @@ enum { NODE_DEF = 0x50, NODE_PS = 0xa0, FXR_ROOT = 0x30, FXR_MAGIC = 0x00525846,
        NODES_SCANNED = 512, NODE_LINES = 8, WATCHED = 64, WRAPPED = 8, PS_LINES = 4, PS_DUMP = 0x100,
        PS_POINTERS = 4, PS_POINTED = 0x100 };
 static const float OLD_NODE = 5.0f;
+/* Emitter nodes: count +0xe0, next emission +0xe4, limit +0xe8, end time +0xec, interval +0xf0;
+ * the state map's flags at [[+0xd0]+0x10] + 0xa0 * index + 4, index = [[+0xd0]+8][[+0xd8]]. */
+enum { EMITTER_INSTANCES = 2, EMITTER_LINES = 8, ROCK_EMITTER = 0x4098 };
+static const float EMIT_INTERVAL = 1.0f / 60;
 enum { NODE_INSTANCE = 0x58, HANDLE_NEXT = 0x18, FLAG_KILL = 4, FLAG_STOP = 8 };
 /* Holder (game side): state +0x0c, flags +0x10 (bit 0 = end requested), owner +0x18. Value set:
  * keys +0x08, values +0x10, count +0x18. */
@@ -753,6 +768,89 @@ static int print_old_nodes(int32_t id, uint64_t instance, int budget) {
     return printed;
 }
 
+static int32_t node_id(uint64_t node) {
+    uint64_t instance = 0;
+    int32_t id = 0;
+    if (node) memcpy(&instance, (const void *)(uintptr_t)(node + NODE_INSTANCE), 8);
+    return read_id(instance, &id) ? id : 0;
+}
+
+/* The FXR file offset of a node's definition, or 0. */
+static uint64_t node_def_offset(uint64_t instance, uint64_t node) {
+    const uint64_t root_def = read64(read64(instance + INST_ROOT) + NODE_DEF), base = root_def - FXR_ROOT;
+    const uint64_t def = read64(node + NODE_DEF);
+    uint32_t magic = 0;
+    if (!root_def || !bb_read(base, &magic, 4) || magic != FXR_MAGIC || def < base || def - base >= FXR_SPAN)
+        return 0;
+    return def - base;
+}
+
+/* One emitter line: `event`, then the node's emission and end fields (as u32 and float). */
+static void print_emitter(const char *event, uint64_t node, uint64_t rsp, uint64_t frame) {
+    unsigned char b[0x100];
+    uint64_t instance = 0;
+    if (!bb_read(node, b, sizeof(b))) return;
+    memcpy(&instance, b + NODE_INSTANCE, 8);
+    int32_t id = 0;
+    uint32_t count, limit, end, phase, flags78, index = 0, state_flags = 0, instance_flags = 0;
+    float age, next, interval, count_f, limit_f, end_f;
+    uint64_t states, d8 = 0;
+    bb_read(instance + INST_ID, &id, 4);
+    bb_read(instance + INST_FLAGS, &instance_flags, 4);
+    memcpy(&count, b + 0xe0, 4), memcpy(&count_f, b + 0xe0, 4), memcpy(&next, b + 0xe4, 4);
+    memcpy(&limit, b + 0xe8, 4), memcpy(&limit_f, b + 0xe8, 4);
+    memcpy(&end, b + 0xec, 4), memcpy(&end_f, b + 0xec, 4);
+    memcpy(&interval, b + 0xf0, 4), memcpy(&age, b + 0x7c, 4);
+    memcpy(&phase, b + 0xdc, 4), memcpy(&flags78, b + 0x78, 4);
+    memcpy(&states, b + 0xd0, 8), memcpy(&d8, b + 0xd8, 4);
+    const int have_state = states && bb_read(read64(states + 8) + d8 * 4, &index, 4) &&
+                           bb_read(read64(states + 0x10) + 0xa0ull * index + 4, &state_flags, 4);
+    char from[200] = "", state[24] = "?";
+    if (rsp || frame) format_from(from, sizeof(from), rsp ? read64(rsp) : 0, frame);
+    if (have_state) snprintf(state, sizeof(state), "0x%x", state_flags);
+    printf("FX: emitter %s %d inst=0x%llx node=0x%llx def=0x%llx age=%g phase=%u flags=0x%x count=%u(%g) "
+           "limit=%u(%g) end=%u(%g) next=%g interval=%g st_index=%u st_flags=%s inst_flags=0x%x%s\n", event, id,
+           (unsigned long long)instance, (unsigned long long)node,
+           (unsigned long long)node_def_offset(instance, node), age, phase, flags78, count, count_f, limit,
+           limit_f, end, end_f, next, interval, index, state, instance_flags, from);
+}
+
+void bb_fx_trace_node_event(const char *event, uint64_t node, uint64_t rsp, uint64_t frame) {
+    /* Under "all" every node's events would use up the budget. */
+    if (g_all || !node || !followed(node_id(node)) || !may_log()) return;
+    print_emitter(event, node, rsp, frame);
+    fflush(stdout);
+}
+
+void bb_fx_trace_phase(uint64_t node, uint32_t next, uint64_t site, uint64_t frame) {
+    uint32_t phase;
+    memcpy(&phase, (const void *)(uintptr_t)(node + 0xdc), 4);
+    if (g_all || phase == next || !followed(node_id(node))) return;
+    char event[48];
+    snprintf(event, sizeof(event), "phase=%u>%u@0x%llx", phase, next, (unsigned long long)site);
+    if (!may_log()) return;
+    print_emitter(event, node, 0, frame);
+    fflush(stdout);
+}
+
+/* Emitter nodes (the rock emitter, or any in phase 1 at 1/60 s) of the oldest followed instances. */
+static int print_emitters(uint64_t instance, int budget) {
+    static uint64_t nodes[NODES_SCANNED];
+    const int n = collect_nodes(instance, NODES_SCANNED, nodes, NODES_SCANNED);
+    int printed = 0;
+    for (int i = 0; i < n && i < NODES_SCANNED && printed < budget; ++i) {
+        uint32_t phase = 0;
+        float interval = 0;
+        bb_read(nodes[i] + 0xdc, &phase, 4);
+        bb_read(nodes[i] + 0xf0, &interval, 4);
+        const int rocks = node_def_offset(instance, nodes[i]) == ROCK_EMITTER;
+        if (!rocks && !(phase == 1 && interval > EMIT_INTERVAL * 0.99f && interval < EMIT_INTERVAL * 1.01f)) continue;
+        print_emitter("second", nodes[i], 0, 0);
+        ++printed;
+    }
+    return printed;
+}
+
 /* " name=[a,b,...]": `bytes` of dwords at `at`, in hex. */
 static size_t append_dwords(char *out, size_t size, size_t used, const char *name, uint64_t at, int bytes) {
     uint32_t words[64];
@@ -818,7 +916,7 @@ void bb_fx_trace_report(uint64_t list_head, uint64_t now) {
              atomic_exchange(&g_suppressed, 0));
 
     static char line[4096];
-    int node_lines = 0;
+    int node_lines = 0, emitter_lines = 0;
     if (g_all) {
         size_t used = append(line, sizeof(line), 0, "FX: second all live=%d nodes=%d", n, walk.nodes);
         used = append_top(line, sizeof(line), used, "top_live", counts, SLOTS, 0);
@@ -878,6 +976,8 @@ void bb_fx_trace_report(uint64_t list_head, uint64_t now) {
         append(line, sizeof(line), used, "%s", tail);
         puts(line);
         for (int i = 0; i < shown && i < HOLDERS_SHOWN; ++i) print_holder(id, mine[i].instance);
+        for (int i = 0; i < shown && i < EMITTER_INSTANCES && emitter_lines < EMITTER_LINES; ++i)
+            emitter_lines += print_emitters(mine[i].instance, EMITTER_LINES - emitter_lines);
         for (int i = 0; i < shown && node_lines < NODE_LINES; ++i)
             node_lines += print_old_nodes(id, mine[i].instance, NODE_LINES - node_lines);
     }
@@ -905,6 +1005,27 @@ static BB_GUEST_ABI void on_node(uint64_t system, uint64_t pos, uint64_t matrix,
 static BB_GUEST_ABI void on_externals(BbRegs *regs) {
     bb_fx_trace_externals(regs->rdi, regs->rsi, bb_regs_rsp(regs), regs->rbp);
 }
+static BB_GUEST_ABI void on_node_end(BbRegs *regs) {
+    bb_fx_trace_node_event("end_handler", regs->rdi, bb_regs_rsp(regs), regs->rbp);
+}
+static BB_GUEST_ABI void on_phase_a(BbRegs *regs) {
+    bb_fx_trace_phase(regs->r13, (uint32_t)regs->rax, NODE_PHASE_A, regs->rbp);
+}
+static BB_GUEST_ABI void on_phase_b(BbRegs *regs) {
+    bb_fx_trace_phase(regs->r13, (uint32_t)regs->rax, NODE_PHASE_B, regs->rbp);
+}
+#define ON_KILL(i)                                                                     \
+    static BB_GUEST_ABI void on_kill_##i(BbRegs *regs) {                               \
+        char event[24];                                                                \
+        snprintf(event, sizeof(event), "kill@0x%llx", (unsigned long long)NODE_KILLS[i]); \
+        bb_fx_trace_node_event(event, regs->r13, 0, regs->rbp);                        \
+    }
+ON_KILL(0)
+ON_KILL(1)
+ON_KILL(2)
+ON_KILL(3)
+static void (BB_GUEST_ABI *const on_kills[])(BbRegs *) = {on_kill_0, on_kill_1, on_kill_2, on_kill_3};
+
 static BB_GUEST_ABI void on_child(uint64_t system, int32_t id, uint64_t def, uint64_t a, uint64_t b,
                                   uint64_t parent) {
     (void)system, (void)def, (void)a, (void)b;
@@ -927,7 +1048,11 @@ int bb_fx_trace_install(void) {
     } const sites[] = {{CREATE_RETURN, &create_return_code}, {INSTANCE_STOP, &stop_code},
                        {INSTANCE_KILL, &kill_code},          {INSTANCE_RELEASE, &release_code},
                        {INSTANCE_UPDATE, &update_code},      {NODE_CREATE, &node_create_code},
-                       {CHILD_EFFECT, &child_effect_code},   {INSTANCE_EXTERNALS, &externals_code}};
+                       {CHILD_EFFECT, &child_effect_code},   {INSTANCE_EXTERNALS, &externals_code},
+                       {NODE_END, &node_end_code},           {NODE_PHASE_A, &node_phase_code},
+                       {NODE_PHASE_B, &node_phase_code},     {NODE_KILLS[0], &node_kill_code},
+                       {NODE_KILLS[1], &node_kill_code},     {NODE_KILLS[2], &node_kill_code},
+                       {NODE_KILLS[3], &node_kill_code}};
     /* All or nothing: a half-installed trace would read as instances never stopped. */
     for (size_t i = 0; i < sizeof(sites) / sizeof(*sites); ++i)
         if (!bb_code_is(bb_guest(sites[i].at), *sites[i].code)) {
@@ -943,7 +1068,14 @@ int bb_fx_trace_install(void) {
                       !bb_hook_entry(INSTANCE_UPDATE, update_code, (void *)on_update) +
                       !bb_hook_entry(NODE_CREATE, node_create_code, (void *)on_node) +
                       !bb_hook_entry(CHILD_EFFECT, child_effect_code, (void *)on_child) +
-                      !bb_hook_mid(INSTANCE_EXTERNALS, externals_code, on_externals);
+                      !bb_hook_mid(INSTANCE_EXTERNALS, externals_code, on_externals) +
+                      !bb_hook_mid(NODE_END, node_end_code, on_node_end) +
+                      !bb_hook_mid(NODE_PHASE_A, node_phase_code, on_phase_a) +
+                      !bb_hook_mid(NODE_PHASE_B, node_phase_code, on_phase_b) +
+                      !bb_hook_mid(NODE_KILLS[0], node_kill_code, on_kills[0]) +
+                      !bb_hook_mid(NODE_KILLS[1], node_kill_code, on_kills[1]) +
+                      !bb_hook_mid(NODE_KILLS[2], node_kill_code, on_kills[2]) +
+                      !bb_hook_mid(NODE_KILLS[3], node_kill_code, on_kills[3]);
     if (hooks != (int)(sizeof(sites) / sizeof(*sites)))
         printf("FX trace: only %d of %d hooks went in (%s)\n", hooks, (int)(sizeof(sites) / sizeof(*sites)),
                bb_hooks_error());

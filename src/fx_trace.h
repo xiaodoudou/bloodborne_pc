@@ -25,6 +25,9 @@ void bb_fx_trace_created(uint64_t instance, uint64_t frame);
 void bb_fx_trace_flagged(uint64_t instance, int kill, uint64_t rsp, uint64_t frame);
 /* External values set on an instance (key 0 = 1.0 asks it to end), at the setter's entry. */
 void bb_fx_trace_externals(uint64_t instance, uint64_t set, uint64_t rsp, uint64_t frame);
+/* A node event (end handler, node-ending write) and a node phase change, for followed instances. */
+void bb_fx_trace_node_event(const char *event, uint64_t node, uint64_t rsp, uint64_t frame);
+void bb_fx_trace_phase(uint64_t node, uint32_t next, uint64_t site, uint64_t frame);
 /* An instance the library's collector is about to free. */
 void bb_fx_trace_destroyed(uint64_t instance);
 /* An instance's update with the frame time it receives. */

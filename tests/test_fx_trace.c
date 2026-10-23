@@ -26,6 +26,10 @@ static Block ps, particles;
 static uint64_t ps_vtable[8];
 static _Alignas(16) unsigned char fxr[0x5000];
 static int ps_updates;
+/* node[1]'s state map: index table at +8 ([+0xd8] = 0 picks index 2), states of 0xa0 bytes at +0x10. */
+static Block states;
+static uint32_t state_index[2] = {2, 0};
+static _Alignas(16) unsigned char state_table[0xa0 * 3];
 typedef uint64_t (BB_GUEST_ABI *SlotFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 static BB_GUEST_ABI uint64_t ps_update(uint64_t self, uint64_t context, uint64_t commands) {
     assert(self == (uint64_t)(uintptr_t)ps.b && context == 1 && commands == 2);
@@ -115,6 +119,13 @@ int main(void) {
     memcpy(node[1].b + 0x7c, &six, 4);
     memcpy(node[1].b + 0xf0, &one, 4);
     put32(&node[1], 0xdc, 7);
+    put32(&node[1], 0xe0, 5);
+    put32(&node[1], 0xe8, 0xffffffff);
+    put64(&node[1], 0xd0, at(&states));
+    put64(&states, 8, (uint64_t)(uintptr_t)state_index);
+    put64(&states, 0x10, (uint64_t)(uintptr_t)state_table);
+    const uint32_t state_flags = 0x77;
+    memcpy(state_table + 0xa0 * 2 + 4, &state_flags, 4);
     put64(&node[1], 0xa0, at(&ps));
     ps_vtable[3] = (uint64_t)(uintptr_t)ps_update;
     ps_vtable[7] = (uint64_t)(uintptr_t)ps_finished;
@@ -150,6 +161,11 @@ int main(void) {
     put32(&inst[0], 0x88, 3 | 8);  /* what the stop then sets */
     bb_fx_trace_flagged(at(&inst[0]), 0, (uint64_t)(uintptr_t)&stop_return, frame);
     bb_fx_trace_flagged(at(&inst[0]), 0, 0, 0);
+    /* Node events: the end handler (with its caller), and phase changes only when they change. */
+    bb_fx_trace_node_event("end_handler", at(&node[1]), (uint64_t)(uintptr_t)&stop_return, frame);
+    bb_fx_trace_phase(at(&node[1]), 5, 0x284e312, 0);
+    bb_fx_trace_phase(at(&node[1]), 7, 0x284e312, 0);
+    bb_fx_trace_node_event("end_handler", at(&node[5]), 0, 0);  /* another instance */
     /* External values: key 0 = 1.0 is the end request; others are logged a few times. */
     uint32_t keys[2] = {0, 3}, values[2] = {0x3f800000, 0x3f000000}, other_key = 2;
     Block set, other_set;
@@ -227,7 +243,7 @@ int main(void) {
     assert(strstr(text, "] o=[0,0,0,0,0,0,0,0,7f,0,"));
     assert(strstr(text, "FX: second id=1251721 live=0 "));  /* the default follows both ids */
     snprintf(want, sizeof(want), "FX: node 1251720 inst=0x%llx node=0x%llx age=6.00 phase=7 dur=1 flags=0x0 "
-             "ctrl_state=0 ctrl_time=0 d8=0 e0=0 parent=0x%llx ps=0x%llx ps_vt=0x%llx ps_update=0x%llx "
+             "ctrl_state=0 ctrl_time=0 d8=0 e0=7.00649e-45 parent=0x%llx ps=0x%llx ps_vt=0x%llx ps_update=0x%llx "
              "ps_finished=0x%llx ps_done=? fxr=[+50:0x4098", (unsigned long long)at(&inst[0]),
              (unsigned long long)at(&node[1]), (unsigned long long)at(&node[0]), (unsigned long long)at(&ps),
              (unsigned long long)(uintptr_t)ps_vtable, (unsigned long long)(uintptr_t)ps_update,
@@ -242,6 +258,18 @@ int main(void) {
              (unsigned long long)(uintptr_t)ps_vtable);
     assert(strstr(text, want));
     assert(strstr(text, "] p8=[0,41200000,0,"));
+    snprintf(want, sizeof(want), "FX: emitter end_handler 1251720 inst=0x%llx node=0x%llx def=0x4098 age=6 phase=7 "
+             "flags=0x0 count=5(", (unsigned long long)at(&inst[0]), (unsigned long long)at(&node[1]));
+    assert(strstr(text, want));
+    assert(strstr(text, " limit=4294967295(-nan) end=0(0) next=0 interval=1 st_index=2 st_flags=0x77 inst_flags=0xb "
+                        "from=0x333<0x111<0x222\n"));
+    snprintf(want, sizeof(want), "FX: emitter phase=7>5@0x284e312 1251720 inst=0x%llx node=0x%llx def=0x4098 ",
+             (unsigned long long)at(&inst[0]), (unsigned long long)at(&node[1]));
+    assert(strstr(text, want));
+    assert(count_of(text, "FX: emitter phase=") == 1 && count_of(text, "FX: emitter end_handler") == 1);
+    snprintf(want, sizeof(want), "FX: emitter second 1251720 inst=0x%llx node=0x%llx def=0x4098 ",
+             (unsigned long long)at(&inst[0]), (unsigned long long)at(&node[1]));
+    assert(strstr(text, want));
     assert(strstr(text, " ps_done=1 fxr=[+50:0x4098"));  /* the next report has the finished result */
     assert(strstr(text, "FX: second id=1251720 live=2 list=2 created=2 nodes=[5,0] new=[2,0] handles=[3,1] "
                         "state=[stop,run] hflags=[-,0x1] age=[2.0,2.0] child=1 child_in=1251720 children=2 dt=0.0111 "
