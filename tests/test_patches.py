@@ -17,7 +17,8 @@ from patches import (EBOOT_BASE, FIXES, FPS_PRESETS, OUTPUT_SIZE, RESOLUTION_TEM
                      eboot_matches_patches, patch_fingerprint, patch_sites, game_app_version,
                      eboot_is_109, SCALED_BASE, SCALED_FPS, SCALED_VALUES, fps_preset, rate_scaled,
                      eboot_segments, rate_corrections, camera_value, EFFECT_RATE_SITES,
-                     CLOTH_STIFFNESS, CLOTH_LEFT_OUT, CLOTH_SUBSTEPS, CLOTH_CAVES, CAMERA_FIELDS, frame_steps, preset_writes, with_external,
+                     CLOTH_STIFFNESS, CLOTH_LEFT_OUT, CLOTH_SUBSTEPS, CLOTH_CAVES, WIND_STEP, WIND_LOADS, CAMERA_FIELDS,
+                     frame_steps, preset_writes, with_external,
                      HEAP_PATCH, HEAP_GUARD, pc_heaps_enabled, site_matches, gx_region_writes,
                      GX_REGION_SITE, GX_REGION_CODE, GX_HEAP_SITE, GX_HEAP_PS4,
                      HASH_GUARDS, guarded_patches)
@@ -269,6 +270,20 @@ class RateCorrectionTests(unittest.TestCase):
         with mock.patch.dict('os.environ', {'BB_CLOTH_FIX': '0'}, clear=True), redirect_stdout(io.StringIO()):
             out = dict(preset_writes(XML, ['90 FPS++'], '90', '01.09', SEGMENTS, elf, {}))
         self.assertNotIn(CLOTH_SUBSTEPS - EBOOT_BASE, out)
+
+    def test_wind_step_follows_the_rate(self):
+        at = WIND_STEP - EBOOT_BASE
+        elf = fake_elf(at, struct.pack('<f', 1 / 60))
+
+        def corrected(writes, fps, env=None, image=elf):
+            with mock.patch.dict('os.environ', env or {}, clear=True), redirect_stdout(io.StringIO()):
+                return dict(rate_corrections(writes, fps, image, {}))
+        self.assertEqual(corrected([], 90)[at], struct.pack('<f', 1 / 90))
+        # The base's loads read a real-dt cell instead (120/144).
+        self.assertNotIn(at, corrected([(WIND_LOADS - EBOOT_BASE, bytes(4))], 120))
+        self.assertNotIn(at, corrected([], None))
+        self.assertNotIn(at, corrected([], 90, {'BB_WIND_FIX': '0'}))
+        self.assertNotIn(at, corrected([], 90, image=fake_elf(at, bytes(4))))
 
     def test_camera_only_when_asked(self):
         writes, out = self.corrected(144)
