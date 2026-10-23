@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <windows.h>
+#include "engine_hooks.h"
 #include "fx_trace.h"
 
 enum { TRAIL = 1251720, OTHER = 42 };
@@ -20,6 +21,18 @@ typedef struct {
 
 static Block inst[4], node[8], handle[3], holder, owner;
 static uint64_t holder_vtable[8];
+/* A particle system with its vtable (update +0x18, finished test +0x38) and a pointed-to block. */
+static Block ps, particles;
+static uint64_t ps_vtable[8];
+static _Alignas(16) unsigned char fxr[0x5000];
+static int ps_updates;
+typedef uint64_t (BB_GUEST_ABI *SlotFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static BB_GUEST_ABI uint64_t ps_update(uint64_t self, uint64_t context, uint64_t commands) {
+    assert(self == (uint64_t)(uintptr_t)ps.b && context == 1 && commands == 2);
+    ++ps_updates;
+    return 77;
+}
+static BB_GUEST_ABI uint64_t ps_finished(uint64_t self) { return self == (uint64_t)(uintptr_t)ps.b; }
 static uint64_t frames[3][2];  /* saved frame pointer, return address */
 static uint64_t stop_return = 0x333;
 
@@ -93,6 +106,21 @@ int main(void) {
     put32(&owner, 0x20, 0x7f);
     put64(&inst[1], 0x90, at(&holder) + 0x80);
     assert(bb_fx_trace_handles(at(&inst[1]), 100) == 1);
+    /* node[1] is old (age 6 s, phase 7) with a particle system; the FXR's root node at +0x30 is
+     * the root node's definition, node[1]'s is at file offset 0x4098. */
+    memcpy(fxr, "FXR", 4);
+    put64(&node[0], 0x50, (uint64_t)(uintptr_t)(fxr + 0x30));
+    put64(&node[1], 0x50, (uint64_t)(uintptr_t)(fxr + 0x4098));
+    const float six = 6.0f, one = 1.0f;
+    memcpy(node[1].b + 0x7c, &six, 4);
+    memcpy(node[1].b + 0xf0, &one, 4);
+    put32(&node[1], 0xdc, 7);
+    put64(&node[1], 0xa0, at(&ps));
+    ps_vtable[3] = (uint64_t)(uintptr_t)ps_update;
+    ps_vtable[7] = (uint64_t)(uintptr_t)ps_finished;
+    put64(&ps, 0, (uint64_t)(uintptr_t)ps_vtable);
+    put64(&ps, 8, at(&particles));
+    put32(&particles, 4, 0x41200000);
     /* The library's live list: inst[0] -> inst[1] -> inst[2]. */
     put64(&inst[0], 0x70, at(&inst[1]));
     put64(&inst[1], 0x70, at(&inst[2]));
@@ -135,6 +163,10 @@ int main(void) {
     bb_fx_trace_externals(at(&inst[1]), at(&other_set), 0, 0);
     bb_fx_trace_externals(at(&inst[2]), at(&set), 0, 0);  /* not followed */
     bb_fx_trace_report(list, now_us() + 2000000);
+    /* The report wrapped the system's vtable: the game's calls still reach the originals. */
+    assert(ps_vtable[3] != (uint64_t)(uintptr_t)ps_update && ps_vtable[7] != (uint64_t)(uintptr_t)ps_finished);
+    assert(((SlotFn)(uintptr_t)ps_vtable[3])(at(&ps), 1, 2, 0, 0, 0) == 77 && ps_updates == 1);
+    assert(((SlotFn)(uintptr_t)ps_vtable[7])(at(&ps), 0, 0, 0, 0, 0) == 1);
     bb_fx_trace_destroyed(at(&inst[1]));
     bb_fx_trace_report(list, now_us());
 
@@ -194,6 +226,23 @@ int main(void) {
     assert(strstr(text, want));
     assert(strstr(text, "] o=[0,0,0,0,0,0,0,0,7f,0,"));
     assert(strstr(text, "FX: second id=1251721 live=0 "));  /* the default follows both ids */
+    snprintf(want, sizeof(want), "FX: node 1251720 inst=0x%llx node=0x%llx age=6.00 phase=7 dur=1 flags=0x0 "
+             "ctrl_state=0 ctrl_time=0 d8=0 e0=0 parent=0x%llx ps=0x%llx ps_vt=0x%llx ps_update=0x%llx "
+             "ps_finished=0x%llx ps_done=? fxr=[+50:0x4098", (unsigned long long)at(&inst[0]),
+             (unsigned long long)at(&node[1]), (unsigned long long)at(&node[0]), (unsigned long long)at(&ps),
+             (unsigned long long)(uintptr_t)ps_vtable, (unsigned long long)(uintptr_t)ps_update,
+             (unsigned long long)(uintptr_t)ps_finished);
+    assert(strstr(text, want));
+    snprintf(want, sizeof(want), "FX: ps hook vt=0x%llx update=0x%llx finished=0x%llx\n",
+             (unsigned long long)(uintptr_t)ps_vtable, (unsigned long long)(uintptr_t)ps_update,
+             (unsigned long long)(uintptr_t)ps_finished);
+    assert(strstr(text, want) && count_of(text, "FX: ps hook ") == 1);
+    snprintf(want, sizeof(want), "FX: ps 1251720 inst=0x%llx node=0x%llx ps=0x%llx vt=0x%llx updates=1 done=? o=[",
+             (unsigned long long)at(&inst[0]), (unsigned long long)at(&node[1]), (unsigned long long)at(&ps),
+             (unsigned long long)(uintptr_t)ps_vtable);
+    assert(strstr(text, want));
+    assert(strstr(text, "] p8=[0,41200000,0,"));
+    assert(strstr(text, " ps_done=1 fxr=[+50:0x4098"));  /* the next report has the finished result */
     assert(strstr(text, "FX: second id=1251720 live=2 list=2 created=2 nodes=[5,0] new=[2,0] handles=[3,1] "
                         "state=[stop,run] hflags=[-,0x1] age=[2.0,2.0] child=1 child_in=1251720 children=2 dt=0.0111 "
                         "dtmin=0.0111 dtmax=0.0111 dt_any=0.5000 updates=3 frames=? total=3 untracked=0 "

@@ -20,6 +20,10 @@
  * 1.0 (sub_28505f0): the game's sfx holder (vtable +0x20 = sub_1f75680, handle at +0x80) does it
  * in its update (sub_1f73850) once its flag bit 0 (end requested, +0x10) is set.
  *
+ * Nodes older than 5 s get a line with their lifecycle fields; their particle system (node +0xa0)
+ * is watched by wrapping its class's vtable update (+0x18) and finished test (+0x38) in place:
+ * the wrappers call the original first with the same arguments and return its result.
+ *
  * The once-a-second report runs from whichever hook first sees the second end: the main-frame
  * tick is not there when another patch took that function's entry (Atlas lamp travel does).
  *
@@ -35,6 +39,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 enum {
     CREATE_RETURN = 0x28eb813,    /* sub_28eb7f0, right after call sub_2853020: rax = instance */
@@ -58,6 +65,11 @@ static const BbCode child_effect_code = {20, 0x60b885ecf8e57f6bull};
 static const BbCode externals_code = {6, 0x82d75a35aabe38aaull};
 
 enum { INST_ID = 0x00, INST_NEXT = 0x70, INST_ROOT = 0x78, INST_FLAGS = 0x88, INST_HANDLES = 0x90 };
+/* Node: definition +0x50, particle system +0xa0 (body +0x20); FXR: root node at +0x30. */
+enum { NODE_DEF = 0x50, NODE_PS = 0xa0, FXR_ROOT = 0x30, FXR_MAGIC = 0x00525846, FXR_SPAN = 0x40000,
+       NODES_SCANNED = 512, NODE_LINES = 8, WATCHED = 64, WRAPPED = 8, PS_LINES = 4, PS_DUMP = 0x100,
+       PS_POINTERS = 4, PS_POINTED = 0x100 };
+static const float OLD_NODE = 5.0f;
 enum { NODE_INSTANCE = 0x58, HANDLE_NEXT = 0x18, FLAG_KILL = 4, FLAG_STOP = 8 };
 /* Holder (game side): state +0x0c, flags +0x10 (bit 0 = end requested), owner +0x18. Value set:
  * keys +0x08, values +0x10, count +0x18. */
@@ -68,7 +80,7 @@ enum { HOLDER_HANDLE = 0x80, HOLDER_STATE = 0x0c, HOLDER_FLAGS = 0x10, HOLDER_OW
 static const int32_t DEFAULT_IDS[] = {1251721, 1251720};
 enum { MAX_IDS = 16, MAX_TRACKED = 1024, SHOWN = 24, TOP = 8, CHILD_SLOTS = 1024,
        EVENT_BUDGET = 40, DEPTH = 6, NODE_CAP = 100000, LIST_CAP = 200000, ALL_NODES_CAP = 400000,
-       CODE_END = 0x4000000 };
+       CODE_END = 0x4000000, IMAGE_END = 0x6000000, FFX_CODE = 0x2840000, FFX_CODE_END = 0x2b40000 };
 static const uint64_t SECOND = 1000000;
 
 /* Child effects spawned per id since the last report, with the id of the last instance holding one. */
@@ -187,6 +199,8 @@ static int live_of(int32_t id) {
     return n;
 }
 
+static int collect_nodes(uint64_t instance, int cap, uint64_t *out, int out_size);
+
 /* Lines beyond the budget of each wall-clock second are counted in the next report instead. */
 static int may_log(void) {
     const uint64_t now = now_us();
@@ -205,6 +219,15 @@ static void maybe_report(void) {
     if (now < due || !atomic_compare_exchange_strong(&g_next_report, &due, now + SECOND)) return;
     bb_fx_trace_report((uint64_t)(uintptr_t)bb_guest(LIVE_LIST), now);
 }
+
+/* An address in the image as an image offset (code or data), else 0. */
+static uint64_t image_offset(uint64_t address) {
+    const uint64_t base = (uint64_t)(uintptr_t)bb_guest(0);
+    if (!base) return address;
+    return address > base && address - base < IMAGE_END ? address - base : 0;
+}
+
+static int in_image(uint64_t address) { return bb_guest(0) && image_offset(address); }
 
 static uint64_t code_offset(uint64_t address) {
     const uint64_t base = (uint64_t)(uintptr_t)bb_guest(0);
@@ -372,13 +395,16 @@ void bb_fx_trace_child(int32_t id, uint64_t parent_node) {
     fflush(stdout);
 }
 
-int bb_fx_trace_nodes(uint64_t instance, int cap) {
+int bb_fx_trace_nodes(uint64_t instance, int cap) { return collect_nodes(instance, cap, NULL, 0); }
+
+static int collect_nodes(uint64_t instance, int cap, uint64_t *out, int out_size) {
     int n = 0;
     uint64_t node = read64(instance + INST_ROOT);
     /* The library's own walk (sub_284f0e0): first child, else next sibling, else up. */
     while (node && n < cap) {
         uint64_t links[4];  /* instance, parent, sibling, child */
         if (!bb_read(node + NODE_INSTANCE, links, sizeof(links)) || links[0] != instance) break;
+        if (out && n < out_size) out[n] = node;
         ++n;
         if (links[3]) {
             node = links[3];
@@ -517,6 +543,216 @@ static size_t append_list(char *out, size_t size, size_t used, int what, const T
     return append(out, size, used, "]");
 }
 
+/* Particle systems ([node+0xa0]) of old nodes of followed instances, as the report found them,
+ * and the vtables whose update (+0x18) and finished test (+0x38) are wrapped to watch them. */
+typedef struct {
+    atomic_ullong ps, instance, node, logged_us;
+    atomic_uint updates, done;  /* done: last finished-test result + 1, 0 = not seen */
+} Watched;
+typedef struct {
+    atomic_ullong vtable, update, finished;
+} Wrapped;
+typedef uint64_t (BB_GUEST_ABI *SlotFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static Watched g_watched[WATCHED];
+static Wrapped g_wrapped[WRAPPED];
+static atomic_ullong g_ps_window;
+static atomic_uint g_ps_lines;
+
+static Watched *watched(uint64_t ps) {
+    for (int i = 0; i < WATCHED; ++i)
+        if (atomic_load_explicit(&g_watched[i].ps, memory_order_relaxed) == ps) return &g_watched[i];
+    return NULL;
+}
+
+static const Wrapped *wrapped(uint64_t vtable) {
+    for (int i = 0; i < WRAPPED; ++i)
+        if (atomic_load_explicit(&g_wrapped[i].vtable, memory_order_acquire) == vtable) return &g_wrapped[i];
+    return NULL;
+}
+
+/* At most PS_LINES particle-system lines a wall-clock second. */
+static int may_log_ps(void) {
+    const uint64_t now = now_us();
+    uint64_t start = atomic_load(&g_ps_window);
+    if (now - start >= SECOND && atomic_compare_exchange_strong(&g_ps_window, &start, now))
+        atomic_store(&g_ps_lines, 0);
+    return atomic_fetch_add(&g_ps_lines, 1) < PS_LINES;
+}
+
+static size_t append_dwords(char *out, size_t size, size_t used, const char *name, uint64_t at, int bytes);
+
+/* After a watched system's update: its first fields and what its heap pointers point at. */
+static void print_ps(Watched *w, uint64_t ps) {
+    static char text[4096];
+    const uint64_t now = now_us();
+    uint64_t last = atomic_load(&w->logged_us);
+    if (now - last < SECOND || !atomic_compare_exchange_strong(&w->logged_us, &last, now) || !may_log_ps())
+        return;
+    int32_t id = 0;
+    bb_read(atomic_load(&w->instance) + INST_ID, &id, 4);
+    const unsigned done = atomic_load(&w->done);
+    size_t used = append(text, sizeof(text), 0,
+                         "FX: ps %d inst=0x%llx node=0x%llx ps=0x%llx vt=0x%llx updates=%u done=%s",
+                         id, (unsigned long long)atomic_load(&w->instance), (unsigned long long)atomic_load(&w->node),
+                         (unsigned long long)ps, (unsigned long long)image_offset(read64(ps)),
+                         atomic_exchange(&w->updates, 0), done ? (done > 1 ? "1" : "0") : "?");
+    used = append_dwords(text, sizeof(text), used, "o", ps, PS_DUMP);
+    uint64_t fields[PS_DUMP / 8];
+    int pointers = 0;
+    if (bb_read(ps, fields, sizeof(fields)))
+        for (int i = 1; i < PS_DUMP / 8 && pointers < PS_POINTERS; ++i) {
+            uint64_t probe;
+            if (!fields[i] || in_image(fields[i]) || (fields[i] & 7) || !bb_read(fields[i], &probe, 8)) continue;
+            char name[16];
+            snprintf(name, sizeof(name), "p%x", i * 8);
+            used = append_dwords(text, sizeof(text), used, name, fields[i], PS_POINTED);
+            ++pointers;
+        }
+    puts(text);
+    fflush(stdout);
+}
+
+/* No calls before the original runs: a call could clobber vector arguments. */
+static inline uint64_t vtable_of(uint64_t object) {
+    uint64_t vtable;
+    memcpy(&vtable, (const void *)(uintptr_t)object, 8);
+    return vtable;
+}
+
+static BB_GUEST_ABI uint64_t on_ps_update(uint64_t ps, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+    const Wrapped *slot = wrapped(vtable_of(ps));
+    const uint64_t result = ((SlotFn)(uintptr_t)atomic_load(&slot->update))(ps, b, c, d, e, f);
+    Watched *w = watched(ps);
+    if (w) {
+        atomic_fetch_add_explicit(&w->updates, 1, memory_order_relaxed);
+        print_ps(w, ps);
+    }
+    return result;
+}
+
+static BB_GUEST_ABI uint64_t on_ps_finished(uint64_t ps, uint64_t b, uint64_t c, uint64_t d, uint64_t e,
+                                            uint64_t f) {
+    const Wrapped *slot = wrapped(vtable_of(ps));
+    const uint64_t result = ((SlotFn)(uintptr_t)atomic_load(&slot->finished))(ps, b, c, d, e, f);
+    Watched *w = watched(ps);
+    if (w) atomic_store_explicit(&w->done, (result & 0xff) ? 2u : 1u, memory_order_relaxed);
+    return result;
+}
+
+static int in_ffx_code(uint64_t address) {
+    const uint64_t base = (uint64_t)(uintptr_t)bb_guest(0);
+    if (!base) return address != 0;  /* tests: no image */
+    return address >= base + FFX_CODE && address < base + FFX_CODE_END;
+}
+
+static void put_slot(uint64_t slot, uint64_t value) {
+#ifdef _WIN32
+    DWORD old;
+    if (!VirtualProtect((void *)(uintptr_t)slot, 8, PAGE_READWRITE, &old)) return;
+    atomic_store((atomic_ullong *)(uintptr_t)slot, value);
+    VirtualProtect((void *)(uintptr_t)slot, 8, old, &old);
+#else
+    atomic_store((atomic_ullong *)(uintptr_t)slot, value);
+#endif
+}
+
+/* Wraps a particle-system vtable's update and finished test, once; only when both are library code.
+ * The wrappers call the original first with every integer argument and hand back its result. */
+static void wrap_vtable(uint64_t vtable) {
+    if (!vtable || wrapped(vtable)) return;
+    const uint64_t update = read64(vtable + 0x18), finished = read64(vtable + 0x38);
+    if (!in_ffx_code(update) || !in_ffx_code(finished)) return;
+    for (int i = 0; i < WRAPPED; ++i) {
+        if (atomic_load(&g_wrapped[i].vtable)) continue;
+        atomic_store(&g_wrapped[i].update, update);
+        atomic_store(&g_wrapped[i].finished, finished);
+        atomic_store_explicit(&g_wrapped[i].vtable, vtable, memory_order_release);
+        put_slot(vtable + 0x18, (uint64_t)(uintptr_t)on_ps_update);
+        put_slot(vtable + 0x38, (uint64_t)(uintptr_t)on_ps_finished);
+        printf("FX: ps hook vt=0x%llx update=0x%llx finished=0x%llx\n", (unsigned long long)image_offset(vtable),
+               (unsigned long long)image_offset(update), (unsigned long long)image_offset(finished));
+        return;
+    }
+}
+
+static void watch(uint64_t ps, uint64_t instance, uint64_t node) {
+    if (watched(ps)) return;
+    for (int i = 0; i < WATCHED; ++i) {
+        uint64_t old = atomic_load(&g_watched[i].ps);
+        if (old) {
+            /* Reuse the entry of a system whose node no longer holds it. */
+            if (read64(atomic_load(&g_watched[i].node) + NODE_PS) == old) continue;
+        }
+        atomic_store(&g_watched[i].ps, 0);
+        atomic_store(&g_watched[i].instance, instance);
+        atomic_store(&g_watched[i].node, node);
+        atomic_store(&g_watched[i].logged_us, 0);
+        atomic_store(&g_watched[i].updates, 0);
+        atomic_store(&g_watched[i].done, 0);
+        atomic_store_explicit(&g_watched[i].ps, ps, memory_order_release);
+        return;
+    }
+}
+
+/* Pointers in the node's first 0x100 bytes that land in the instance's FXR (the root node's
+ * definition sits at file offset 0x30), as file offsets. */
+static size_t append_fxr(char *out, size_t size, size_t used, uint64_t instance, uint64_t node) {
+    const uint64_t root_def = read64(read64(instance + INST_ROOT) + NODE_DEF), base = root_def - FXR_ROOT;
+    uint32_t magic = 0;
+    if (!root_def || !bb_read(base, &magic, 4) || magic != FXR_MAGIC) return append(out, size, used, " fxr=?");
+    uint64_t fields[0x100 / 8];
+    if (!bb_read(node, fields, sizeof(fields))) return append(out, size, used, " fxr=?");
+    used = append(out, size, used, " fxr=[");
+    int shown = 0;
+    for (int i = 0; i < 0x100 / 8; ++i)
+        if (fields[i] >= base && fields[i] - base < FXR_SPAN)
+            used = append(out, size, used, "%s+%x:0x%llx", shown++ ? "," : "", i * 8,
+                          (unsigned long long)(fields[i] - base));
+    return append(out, size, used, "]");
+}
+
+/* Old nodes of a followed instance: their lifecycle fields, and their particle systems watched. */
+static int print_old_nodes(int32_t id, uint64_t instance, int budget) {
+    static uint64_t nodes[NODES_SCANNED];
+    static char text[1024];
+    const int n = collect_nodes(instance, NODES_SCANNED, nodes, NODES_SCANNED);
+    int printed = 0;
+    for (int i = 0; i < n && i < NODES_SCANNED && printed < budget; ++i) {
+        unsigned char b[0x100];
+        if (!bb_read(nodes[i], b, sizeof(b))) continue;
+        float age, dur, e0, ctrl_time = 0;
+        uint32_t flags, phase, d8, ctrl_state = 0;
+        uint64_t ctrl, parent, ps;
+        memcpy(&age, b + 0x7c, 4), memcpy(&dur, b + 0xf0, 4), memcpy(&e0, b + 0xe0, 4);
+        memcpy(&flags, b + 0x78, 4), memcpy(&phase, b + 0xdc, 4);
+        memcpy(&ctrl, b + 0xc8, 8), memcpy(&d8, b + 0xd8, 4);
+        memcpy(&parent, b + 0x60, 8), memcpy(&ps, b + NODE_PS, 8);
+        if (!(age > OLD_NODE)) continue;
+        if (ctrl) bb_read(ctrl + 4, &ctrl_state, 4), bb_read(ctrl + 8, &ctrl_time, 4);
+        const uint64_t ps_vt = read64(ps);
+        Watched *w = ps ? watched(ps) : NULL;
+        const unsigned done = w ? atomic_load(&w->done) : 0;
+        size_t used = append(text, sizeof(text), 0,
+                             "FX: node %d inst=0x%llx node=0x%llx age=%.2f phase=%u dur=%g flags=0x%x ctrl_state=%u "
+                             "ctrl_time=%g d8=%u e0=%g parent=0x%llx ps=0x%llx ps_vt=0x%llx ps_update=0x%llx "
+                             "ps_finished=0x%llx ps_done=%s", id, (unsigned long long)instance,
+                             (unsigned long long)nodes[i], age, phase, dur, flags, ctrl_state, ctrl_time,
+                             d8, e0, (unsigned long long)parent, (unsigned long long)ps,
+                             (unsigned long long)image_offset(ps_vt),
+                             (unsigned long long)image_offset(read64(ps_vt + 0x18)),
+                             (unsigned long long)image_offset(read64(ps_vt + 0x38)),
+                             done ? (done > 1 ? "1" : "0") : "?");
+        append_fxr(text, sizeof(text), used, instance, nodes[i]);
+        puts(text);
+        ++printed;
+        if (ps && ps_vt) {
+            watch(ps, instance, nodes[i]);
+            wrap_vtable(ps_vt);
+        }
+    }
+    return printed;
+}
+
 /* " name=[a,b,...]": `bytes` of dwords at `at`, in hex. */
 static size_t append_dwords(char *out, size_t size, size_t used, const char *name, uint64_t at, int bytes) {
     uint32_t words[64];
@@ -541,8 +777,8 @@ static void print_holder(int32_t id, uint64_t instance) {
     size_t used = append(text, sizeof(text), 0,
                          "FX: holder %d inst=0x%llx holder=0x%llx vt=0x%llx state=%u flags=0x%x owner=0x%llx "
                          "owner_vt=0x%llx", id, (unsigned long long)instance, (unsigned long long)holder,
-                         (unsigned long long)code_offset(read64(holder)), state, flags & 0xff,
-                         (unsigned long long)owner, (unsigned long long)code_offset(read64(owner)));
+                         (unsigned long long)image_offset(read64(holder)), state, flags & 0xff,
+                         (unsigned long long)owner, (unsigned long long)image_offset(read64(owner)));
     used = append_dwords(text, sizeof(text), used, "h", holder, HOLDER_DUMP);
     append_dwords(text, sizeof(text), used, "o", owner, OWNER_DUMP);
     puts(text);
@@ -582,6 +818,7 @@ void bb_fx_trace_report(uint64_t list_head, uint64_t now) {
              atomic_exchange(&g_suppressed, 0));
 
     static char line[4096];
+    int node_lines = 0;
     if (g_all) {
         size_t used = append(line, sizeof(line), 0, "FX: second all live=%d nodes=%d", n, walk.nodes);
         used = append_top(line, sizeof(line), used, "top_live", counts, SLOTS, 0);
@@ -641,6 +878,8 @@ void bb_fx_trace_report(uint64_t list_head, uint64_t now) {
         append(line, sizeof(line), used, "%s", tail);
         puts(line);
         for (int i = 0; i < shown && i < HOLDERS_SHOWN; ++i) print_holder(id, mine[i].instance);
+        for (int i = 0; i < shown && node_lines < NODE_LINES; ++i)
+            node_lines += print_old_nodes(id, mine[i].instance, NODE_LINES - node_lines);
     }
     fflush(stdout);
 }
