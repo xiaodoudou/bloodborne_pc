@@ -388,6 +388,8 @@ private:
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
     static u64 MaybeDirtyHash(const Image& image);
+    /// GPU-written contents that guest memory lacks (copied on expansion and overlap merges).
+    bool HoldsGpuData(Image& image);
 
     /// Removes the image and any views/surface metas that reference it.
     /// bbport: now: at once, for an image the GPU is done with (ReclaimMemoryFor).

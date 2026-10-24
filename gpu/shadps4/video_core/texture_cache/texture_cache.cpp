@@ -136,6 +136,16 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     UntrackImage(image_id);
 }
 
+/// bbport: a MaybeCpuDirty image whose guest memory is unchanged (the CPU wrote elsewhere in
+/// its page) still holds valid GPU data.
+bool TextureCache::HoldsGpuData(Image& image) {
+    if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
+        False(image.flags & ImageFlagBits::CpuDirty) && image.hash == MaybeDirtyHash(image)) {
+        image.flags &= ~ImageFlagBits::MaybeCpuDirty;
+    }
+    return image.SafeToDownload();
+}
+
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);
@@ -493,7 +503,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 // InsertImage may have moved every image: look the subresource up again.
                 auto& sub_image = slot_images[cache_image_id];
                 auto& merged_image = slot_images[merged_image_id];
-                runtime.CopyMip(&sub_image, &merged_image, mip, slice);
+                if (HoldsGpuData(sub_image)) {
+                    runtime.CopyMip(&sub_image, &merged_image, mip, slice);
+                }
                 FreeImage(cache_image_id);
             }
         }
@@ -509,8 +521,16 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
+    // Only carry over the old contents when they hold GPU-written data that guest memory lacks.
+    // A CPU-dirty source is stale (e.g. a streamed texture rewritten in a reused pool slot);
+    // copying it would overwrite the fresh upload with old data.
+    const bool src_has_gpu_data = HoldsGpuData(src_image);
+
     RefreshImage(new_image);
-    runtime.CopyImage(&src_image, &new_image);
+    if (src_has_gpu_data) {
+        runtime.CopyImage(&src_image, &new_image);
+    }
+    new_image.flags &= ~ImageFlagBits::Dirty;
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
