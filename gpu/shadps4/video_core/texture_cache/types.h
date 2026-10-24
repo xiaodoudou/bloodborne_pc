@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <algorithm>
 #include "common/slot_vector.h"
 #include "common/types.h"
 
@@ -64,15 +63,7 @@ struct SubresourceExtent {
     u32 levels = 1;
     u32 layers = 1;
 
-    /// Orders levels before layers (for containers): not containment, see Covers.
     auto operator<=>(const SubresourceExtent&) const = default;
-
-    bool Covers(const SubresourceExtent& other) const {
-        return levels >= other.levels && layers >= other.layers;
-    }
-    SubresourceExtent Max(const SubresourceExtent& other) const {
-        return {std::max(levels, other.levels), std::max(layers, other.layers)};
-    }
 };
 
 struct SubresourceRange {

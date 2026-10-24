@@ -238,7 +238,6 @@ page take precedence:
 | NVIDIA GPUs keep their boost clocks (Reflex Boost hint, not with DLSS Frame Generation) | | `BB_NV_BOOST=0` |
 | Hot pages: memory the game rewrites before almost every use stays writable and is uploaded on each use (at most 8 MiB) | | `BB_HOT_PAGES=0` off, `=1` the older rule (no size limit) |
 | Legacy CPU translations (on by themselves on CPUs without BMI1, LZCNT or MOVBE) | `legacy_cpu=0` or `1` | `BB_LEGACY_CPU=0` or `1` |
-| Texture cache expansion and overlap fixes (blood and textures black after a cutscene) | | `BB_EXPAND_KEEP_OLD=1` restores 2.1's |
 
 For testing the legacy CPU translations only, not for play:
 
