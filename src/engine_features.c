@@ -4,6 +4,7 @@
 #include "engine_features.h"
 #include "blur_kernel.h"
 #include "effect_step_gate.h"
+#include "cloth_rate.h"
 #include "engine_hooks.h"
 #include "fx_trace.h"
 #include "key_prompts.h"
@@ -33,7 +34,8 @@ static int menu_pointer_install(void) {
     return 0;
 }
 
-static const Install installs[] = {bb_pc_menu_install, bb_rebirth_install, bb_mouse_camera_install,
+static const Install installs[] = {bb_cloth_rate_install,
+                                   bb_pc_menu_install, bb_rebirth_install, bb_mouse_camera_install,
                                    bb_key_prompts_install, menu_pointer_install,
                                    bb_occlusion_queries_install, bb_blur_kernel_install,
                                    bb_render_jobs_install, bb_effect_step_gate_install,
