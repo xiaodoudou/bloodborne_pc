@@ -124,6 +124,9 @@ typedef void (BB_GUEST_ABI *StepFn)(uint64_t, float);
 /* Set by the manager's update for its frame; the effects' updates read it on their threads. */
 static atomic_int g_between;
 static double g_carry;
+static BbGateState g_state;
+/* Read by the water's update on the scene renderer's side. */
+static _Atomic uint64_t g_whole;
 
 static uint64_t guest(uint64_t bn) { return (uint64_t)(uintptr_t)bb_guest(BB_BN(bn)); }
 static uint64_t read64(uint64_t at) {
@@ -146,6 +149,8 @@ static void write_float(uint64_t at, float v) { memcpy((void *)(uintptr_t)at, &v
 
 static int held(void) { return atomic_load_explicit(&g_between, memory_order_relaxed); }
 int bb_effect_held(void) { return held(); }
+BbGateState bb_effect_step_gate_state(void) { return g_state; }
+uint64_t bb_effect_whole_steps(void) { return atomic_load_explicit(&g_whole, memory_order_acquire); }
 
 static BB_GUEST_ABI uint64_t on_effects(uint64_t manager, float step) {
     const uint64_t sfx = read64(guest(SFX));
@@ -154,6 +159,7 @@ static BB_GUEST_ABI uint64_t on_effects(uint64_t manager, float step) {
     BbEffectFrame frame = {step, 0.0f, 0.0f, 0.0f, 0, 0};
     if (sprj && !read32(sfx + 0x8c)) frame = bb_effect_frame(&g_carry, step);
     atomic_store_explicit(&g_between, frame.between, memory_order_relaxed);
+    if (sprj && !frame.between) atomic_fetch_add_explicit(&g_whole, 1, memory_order_release);
     if (sprj) bb_smooth_begin(manager, &frame);
     const uint64_t result = ((ManagerFn)bb_guest(BB_BN(MANAGER_UPDATE)))(manager, frame.step);
     if (sprj) bb_smooth_end();
@@ -299,6 +305,7 @@ static int hook_slot(uint64_t slot, uint64_t target, void *host) {
 }
 
 int bb_effect_step_gate_install(void) {
+    g_state = BB_GATE_OFF;
     const char *env = getenv("BB_EFFECT_STEP_GATE");
     if (env && !strcmp(env, "0")) {
         puts("Effect step gate: off (BB_EFFECT_STEP_GATE=0)");
@@ -306,6 +313,7 @@ int bb_effect_step_gate_install(void) {
     }
     if (steps_at_thirty()) {
         puts("Effect step gate: not needed, the effects step 1/30 s a frame (30 FPS)");
+        g_state = BB_GATE_AT_THIRTY;
         return 0;
     }
     const uint64_t site = unexpected();
@@ -334,6 +342,7 @@ int bb_effect_step_gate_install(void) {
         printf("Effect step gate: off (%s)\n", bb_hooks_error());
         return hooks + (smooth > 0 ? smooth : 0);
     }
+    g_state = BB_GATE_ON;
     puts("Effect step gate: on; above 30 FPS the effects take whole 1/30 s steps and the frames "
          "between hold what they count per update (BB_EFFECT_STEP_GATE=0 turns it off)");
     if (smooth)
