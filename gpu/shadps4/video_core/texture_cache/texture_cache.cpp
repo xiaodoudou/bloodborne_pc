@@ -214,7 +214,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
     const bool bpp_match = requested_info.num_bits == cache_image.info.num_bits;
 
     // If an image in the cache has less slices we need to expand it
-    bool recreate = cache_image.info.resources < requested_info.resources;
+    bool recreate = !cache_image.info.resources.Covers(requested_info.resources);
 
     switch (binding) {
     case BindingType::Texture:
@@ -248,7 +248,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
 
     if (recreate) {
         auto new_info = requested_info;
-        new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
+        new_info.resources = requested_info.resources.Max(cache_image.info.resources);
         new_info.UpdateSize();
         const auto new_image_id = InsertImage(new_info);
         RegisterImage(new_image_id);
@@ -320,7 +320,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
-            image_info.guest_size <= cache_image.info.guest_size || pow2_padding_only) {
+            (image_info.guest_size <= cache_image.info.guest_size &&
+             cache_image.info.resources.Covers(image_info.resources)) ||
+            pow2_padding_only) {
             auto result_id = merged_image_id ? merged_image_id : cache_image_id;
             const auto& result_image = slot_images[result_id];
             const bool is_compatible =
@@ -330,8 +332,16 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Size and resources are greater, expand the image.
         if (image_info.type == cache_image.info.type &&
-            image_info.resources > cache_image.info.resources) {
-            return {ExpandImage(image_info, cache_image_id), -1, -1};
+            !cache_image.info.resources.Covers(image_info.resources)) {
+            if (image_info.resources.Covers(cache_image.info.resources)) {
+                return {ExpandImage(image_info, cache_image_id), -1, -1};
+            }
+            // One has more mips, the other more layers: their mip-major guest layouts differ,
+            // so the range was reused.
+            if (safe_to_delete) {
+                FreeImage(cache_image_id);
+            }
+            return {merged_image_id, -1, -1};
         }
 
         // Size is greater but resources are not, because the tiling mode is different.
@@ -440,7 +450,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   (image_info.pitch == cache_image.info.pitch),
                   (image_info.props.is_pow2 == cache_image.info.props.is_pow2),
                   (image_info.alt_tile == cache_image.info.alt_tile),
-                  (cache_image.info.resources <= image_info.resources),
+                  image_info.resources.Covers(cache_image.info.resources),
                   cache_image.info.resources.levels, image_info.resources.levels,
                   (cache_image.info.guest_size <= image_info.guest_size), expected_size,
 
@@ -671,7 +681,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
-        } else if (image_resolved.info.resources < info.resources) {
+        } else if (!image_resolved.info.resources.Covers(info.resources)) {
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};

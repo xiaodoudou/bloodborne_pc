@@ -328,6 +328,10 @@ add_executable(shader-user-data-test EXCLUDE_FROM_ALL ../tests/test_shader_user_
 target_compile_options(shader-user-data-test PRIVATE -UNDEBUG)
 target_include_directories(shader-user-data-test PRIVATE shim shadps4 third_party/gcn/include)
 target_link_libraries(shader-user-data-test PRIVATE fmt::fmt Boost::headers)
+add_executable(texture-cache-types-test EXCLUDE_FROM_ALL ../tests/test_texture_cache_types.cpp)
+target_compile_options(texture-cache-types-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(texture-cache-types-test PRIVATE shim shadps4)
+target_link_libraries(texture-cache-types-test PRIVATE fmt::fmt)
 
 # The in-game guide drawn offscreen (tools/overlay_preview.cpp): its own code through ImGui's SDL
 # software renderer, for working on its look without the game.
