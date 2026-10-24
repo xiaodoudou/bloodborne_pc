@@ -895,7 +895,7 @@ class LauncherBackend(QObject):
         self._gameExited.emit(process.wait())
 
     _outputLine = Signal(str)
-    _gameExited = Signal(int)
+    _gameExited = Signal(object)  # Windows status codes do not fit a Qt int
 
     @Slot(str)
     def _receive_line(self, line):
@@ -910,9 +910,11 @@ class LauncherBackend(QObject):
         elif 'restarting through run.py' in line:
             self._set_notice('Restarting with the new settings…')
 
-    @Slot(int)
+    @Slot(object)
     def _receive_exit(self, code):
-        self._append_log(f'\n— The game exited (code {code}) —\n')
+        text = core.exit_code_text(code)
+        code = core.exit_status(code)
+        self._append_log(f'\n— The game exited (code {text}) —\n')
         self.process = None
         if self.job:
             self.job.close()
@@ -926,7 +928,7 @@ class LauncherBackend(QObject):
         if self._game_started or code == 0:
             self._set_notice('Ready to hunt.')
         elif not self._check_port_files():
-            self._set_notice(f'The game could not start (exit code {code}). See the log for details.')
+            self._set_notice(f'The game could not start (exit code {text}). See the log for details.')
         self.gameFinished.emit(code, self._game_started)
 
     def connect_workers(self):
