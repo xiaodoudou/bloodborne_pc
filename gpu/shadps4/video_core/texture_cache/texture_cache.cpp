@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <boost/container/small_vector.hpp>
 #include <xxhash.h>
 
@@ -30,6 +32,68 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+
+/// bbport: BB_EXPAND_KEEP_OLD=1 restores 2.1's expansions and overlap merges: old contents
+/// always copied, a subresource found before its parent dropped, extents ordered levels first.
+static bool KeepOldOverlaps() {
+    static const bool keep = [] {
+        const char* value = std::getenv("BB_EXPAND_KEEP_OLD");
+        return value && value[0] == '1';
+    }();
+    return keep;
+}
+
+static bool ExtentCovers(const SubresourceExtent& extent, const SubresourceExtent& other) {
+    return KeepOldOverlaps() ? !(extent < other) : extent.Covers(other);
+}
+
+/// bbport: one line per expansion or failed overlap with the image involved, at most 20 of each
+/// kind per 5 s, then the number left out. Callers hold the cache's lock.
+struct ImageChangeLog {
+    const char* what;
+    u32 shown = 0;
+    u64 hidden = 0;
+    std::chrono::steady_clock::time_point window{};
+};
+
+static std::string FlagNames(ImageFlagBits flags) {
+    std::string names;
+    for (const auto& [bit, name] : {std::pair{ImageFlagBits::GpuModified, "GpuModified"},
+                                    std::pair{ImageFlagBits::CpuDirty, "CpuDirty"},
+                                    std::pair{ImageFlagBits::MaybeCpuDirty, "MaybeCpuDirty"},
+                                    std::pair{ImageFlagBits::GpuDirty, "GpuDirty"}}) {
+        if (True(flags & bit)) {
+            names += names.empty() ? name : std::string{"|"} + name;
+        }
+    }
+    return names.empty() ? "none" : names;
+}
+
+static void LogImageChange(ImageChangeLog& log, const ImageInfo& from, ImageFlagBits flags,
+                           const ImageInfo& to, const char* outcome) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - log.window >= std::chrono::seconds(5)) {
+        if (log.hidden) {
+            LOG_WARNING(Render_Vulkan, "{}: {} more not shown", log.what, log.hidden);
+        }
+        log.window = now;
+        log.shown = 0;
+        log.hidden = 0;
+    }
+    if (log.shown >= 20) {
+        ++log.hidden;
+        return;
+    }
+    ++log.shown;
+    LOG_WARNING(Render_Vulkan,
+                "{}: {:#x} {} {}x{}x{} -> {} {}x{}x{}, mips {}->{}, layers {}->{}, "
+                "size {:#x}->{:#x}, flags {}, {}",
+                log.what, from.guest_address, vk::to_string(from.pixel_format), from.size.width,
+                from.size.height, from.size.depth, vk::to_string(to.pixel_format), to.size.width,
+                to.size.height, to.size.depth, from.resources.levels, to.resources.levels,
+                from.resources.layers, to.resources.layers, from.guest_size, to.guest_size,
+                FlagNames(flags), outcome);
+}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -137,6 +201,16 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     UntrackImage(image_id);
 }
 
+/// bbport: a MaybeCpuDirty image whose guest memory is unchanged (the CPU wrote elsewhere in
+/// its page) still holds valid GPU data.
+bool TextureCache::HoldsGpuData(Image& image) {
+    if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
+        False(image.flags & ImageFlagBits::CpuDirty) && image.hash == MaybeDirtyHash(image)) {
+        image.flags &= ~ImageFlagBits::MaybeCpuDirty;
+    }
+    return image.SafeToDownload();
+}
+
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);
@@ -205,7 +279,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
     const bool bpp_match = requested_info.num_bits == cache_image.info.num_bits;
 
     // If an image in the cache has less slices we need to expand it
-    bool recreate = cache_image.info.resources < requested_info.resources;
+    bool recreate = !ExtentCovers(cache_image.info.resources, requested_info.resources);
 
     switch (binding) {
     case BindingType::Texture:
@@ -239,7 +313,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
 
     if (recreate) {
         auto new_info = requested_info;
-        new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
+        new_info.resources = KeepOldOverlaps()
+                                 ? std::max(requested_info.resources, cache_image.info.resources)
+                                 : requested_info.resources.Max(cache_image.info.resources);
         new_info.UpdateSize();
         const auto new_image_id = InsertImage(new_info);
         RegisterImage(new_image_id);
@@ -311,7 +387,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
-            image_info.guest_size <= cache_image.info.guest_size || pow2_padding_only) {
+            (image_info.guest_size <= cache_image.info.guest_size &&
+             (KeepOldOverlaps() || cache_image.info.resources.Covers(image_info.resources))) ||
+            pow2_padding_only) {
             auto result_id = merged_image_id ? merged_image_id : cache_image_id;
             const auto& result_image = slot_images[result_id];
             const bool is_compatible =
@@ -321,8 +399,19 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Size and resources are greater, expand the image.
         if (image_info.type == cache_image.info.type &&
-            image_info.resources > cache_image.info.resources) {
-            return {ExpandImage(image_info, cache_image_id), -1, -1};
+            !ExtentCovers(cache_image.info.resources, image_info.resources)) {
+            if (ExtentCovers(image_info.resources, cache_image.info.resources)) {
+                return {ExpandImage(image_info, cache_image_id), -1, -1};
+            }
+            // One has more mips, the other more layers: their mip-major guest layouts differ,
+            // so the range was reused.
+            static ImageChangeLog log{"Unmergeable mips/layers overlap"};
+            LogImageChange(log, cache_image.info, cache_image.flags, image_info,
+                           safe_to_delete ? "cached image freed" : "cached image kept");
+            if (safe_to_delete) {
+                FreeImage(cache_image_id);
+            }
+            return {merged_image_id, -1, -1};
         }
 
         // Size is greater but resources are not, because the tiling mode is different.
@@ -431,7 +520,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   (image_info.pitch == cache_image.info.pitch),
                   (image_info.props.is_pow2 == cache_image.info.props.is_pow2),
                   (image_info.alt_tile == cache_image.info.alt_tile),
-                  (cache_image.info.resources <= image_info.resources),
+                  image_info.resources.Covers(cache_image.info.resources),
                   cache_image.info.resources.levels, image_info.resources.levels,
                   (cache_image.info.guest_size <= image_info.guest_size), expected_size,
 
@@ -482,12 +571,25 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                     return {merged_image_id, -1, -1};
                 }
 
-                // We need to have a larger, already allocated image to copy this one into
-                if (merged_image_id) {
-                    auto& merged_image = slot_images[merged_image_id];
-                    runtime.CopyMip(&cache_image, &merged_image, mip, slice);
-                    FreeImage(cache_image_id);
+                // If we don't have an allocated image, we create one here
+                // Otherwise it's later created from guest memory and the GPU data is lost
+                // And reads/writes go to different images.
+                if (!merged_image_id) {
+                    if (KeepOldOverlaps()) {
+                        return {merged_image_id, -1, -1};
+                    }
+                    merged_image_id = InsertImage(image_info);
+                    RegisterImage(merged_image_id);
+                    RefreshImage(slot_images[merged_image_id]);
+                    TrackImage(merged_image_id);
                 }
+                // InsertImage may have moved every image: look the subresource up again.
+                auto& sub_image = slot_images[cache_image_id];
+                auto& merged_image = slot_images[merged_image_id];
+                if (KeepOldOverlaps() || HoldsGpuData(sub_image)) {
+                    runtime.CopyMip(&sub_image, &merged_image, mip, slice);
+                }
+                FreeImage(cache_image_id);
             }
         }
     }
@@ -502,8 +604,24 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
+    // Only carry over the old contents when they hold GPU-written data that guest memory lacks.
+    // A CPU-dirty source is stale (e.g. a streamed texture rewritten in a reused pool slot);
+    // copying it would overwrite the fresh upload with old data.
+    const ImageFlagBits src_flags = src_image.flags;
+    const bool src_has_gpu_data = HoldsGpuData(src_image);
+    const bool copy = src_has_gpu_data || KeepOldOverlaps();
+    static ImageChangeLog log{"ExpandImage"};
+    LogImageChange(log, src_image.info, src_flags, info,
+                   src_has_gpu_data                              ? "old contents copied"
+                   : False(src_flags & ImageFlagBits::GpuModified) ? "no GPU-written contents"
+                   : copy ? "stale contents copied (BB_EXPAND_KEEP_OLD)"
+                          : "stale contents dropped");
+
     RefreshImage(new_image);
-    runtime.CopyImage(&src_image, &new_image);
+    if (copy) {
+        runtime.CopyImage(&src_image, &new_image);
+    }
+    new_image.flags &= ~ImageFlagBits::Dirty;
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
@@ -644,11 +762,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
-        } else if (image_resolved.info.resources < info.resources) {
+        } else if (!ExtentCovers(image_resolved.info.resources, info.resources)) {
             // The image was clearly picked up wrong.
+            static ImageChangeLog log{"Image overlap resolve failed"};
+            LogImageChange(log, image_resolved.info, image_resolved.flags, info,
+                           "image freed, a new one created");
             FreeImage(image_id);
             image_id = {};
-            LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
         }
     }
     // Create and register a new image
