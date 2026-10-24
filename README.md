@@ -223,6 +223,7 @@ page take precedence:
 | Xbox pads: Back + d-pad left/right for the touchpad halves | | `BB_PAD_BACK_COMBO=0` |
 | Skip draws that cannot change anything | | `BB_SKIP_EMPTY_DRAWS=0` |
 | All engine hooks (in-game menus and features) | | `BB_ENGINE_HOOKS=0` |
+| Texture cache expansion and overlap fixes (blood and textures black after a cutscene) | | `BB_EXPAND_KEEP_OLD=1` restores 2.1's |
 
 ## Known issues
 
