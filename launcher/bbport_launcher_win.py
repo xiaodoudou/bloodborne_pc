@@ -782,10 +782,10 @@ KEYBOARD_PROMPTS = 'Keyboard Prompts (Kenney)'
 XBOX_PROMPTS = 'Xbox Prompts (Kenney)'
 # choice: (mods folder name, launcher/assets/prompts file)
 PROMPT_PACKS = {'Xbox': (XBOX_PROMPTS, 'xbox.json'), 'Keyboard': (KEYBOARD_PROMPTS, 'keyboard.json')}
-# Nexus prompt mods earlier launchers added from the player's download; still prompt mods, so a
-# choice here turns them off.
+# Prompt mods earlier launchers added (the player's Nexus download, or shipped with 1.9.x); still
+# prompt mods, so a choice here turns them off.
 LEGACY_KEYBOARD_PROMPTS = 'Keyboard Prompts (PCBButtons)'
-LEGACY_PROMPT_MODS = (LEGACY_KEYBOARD_PROMPTS, 'Xbox Prompts (Dommo)')
+LEGACY_PROMPT_MODS = (LEGACY_KEYBOARD_PROMPTS, 'Xbox Prompts (Dommo)', 'Xbox 360 Prompts (Elden Ring)')
 KEYBOARD_PROMPT_LAYOUT = {
     'key_interact': 'E', 'key_roll': 'Left Shift', 'key_blood_vial': 'R', 'key_use_item': 'Q',
     'key_transform': 'F', 'key_attack': 'Mouse1', 'key_firearm': 'Mouse2',
