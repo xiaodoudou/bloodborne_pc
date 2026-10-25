@@ -45,8 +45,10 @@ PATCH_VERSION = '01.09'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 # This fork's build; the release tag includes this version.
-VERSION = '2.1'
+VERSION = '2.2-community-1'
 CURRENT_RELEASE_TAG = 'qml-launcher-preview-23'
+# A community build repairs from its own release, not the official one it is built on.
+REPAIR_RELEASE_TAG = 'v2.2-community-1'
 HERO_ART = PORT_DIR / 'launcher' / 'art' / 'hero.png'
 STRIP_ART = PORT_DIR / 'launcher' / 'art' / 'strip.png'
 # Co-op: the community server that answers the game's own server requests.
@@ -55,7 +57,9 @@ COMMUNITY_SERVER = 'https://thehuntersdream.com'
 COMMUNITY_API_PORT = 18671
 RELEASES_API = 'https://api.github.com/repos/Jgamrot/bloodborne_pc/releases/latest'
 RELEASES_PAGE = 'https://github.com/Jgamrot/bloodborne_pc/releases/latest'
-RELEASES_LIST_API = 'https://api.github.com/repos/Jgamrot/bloodborne_pc/releases?per_page=100'
+# Repair's releases: this community build's fork.
+RELEASES_LIST_API = 'https://api.github.com/repos/xiaodoudou/bloodborne_pc/releases?per_page=100'
+REPAIR_PAGE = 'https://github.com/xiaodoudou/bloodborne_pc/releases/tag/v2.2-community-1'
 UPDATE_DIR = Path(tempfile.gettempdir()) / 'bbport-update'
 # The last answer from GitHub, so a direct launch (no launcher window) can check quietly and the
 # launcher shows the result the next time it opens. Off with check_updates like every check.
@@ -2549,18 +2553,18 @@ class Launcher:
 
     def repair_failed(self, missing, error=None):
         """What run.py says about an incomplete copy, with the releases page opened."""
-        text = ''
+        text, page = '', REPAIR_PAGE
         if missing:
             more = _(' and {} more', ' и ещё {}').format(len(missing) - 1) if len(missing) > 1 else ''
             text = _('This copy of the port is incomplete: {} missing from {}. Download the port again from {} '
                      'and unpack the whole zip; copies from other sites often leave files out.',
                      'Эта копия порта неполная: в {1} нет {0}. Скачайте порт заново с {2} и распакуйте весь '
                      'архив; в копиях с других сайтов часто не хватает файлов.').format(
-                         missing[0] + more, PORT_DIR, RELEASES_PAGE)
+                         missing[0] + more, PORT_DIR, page)
         if error:
             text = (_('Repair failed: {}', 'Не удалось восстановить: {}').format(error) + '\n\n' + text).strip()
         self.messagebox.showerror('Bloodborne', text)
-        webbrowser.open(RELEASES_PAGE)
+        webbrowser.open(page)
 
     def clear_cache(self):
         """Shader and pipeline caches; they are rebuilt while playing."""
@@ -2926,7 +2930,7 @@ def repair_port(progress=None, target=None):
             releases = json.load(response)
     except ValueError as error:
         raise OSError(f'unexpected answer from GitHub: {error}') from error
-    found = own_release(releases if isinstance(releases, list) else [])
+    found = own_release(releases if isinstance(releases, list) else [], tag=REPAIR_RELEASE_TAG)
     if not found:
         raise OSError(f'version {VERSION} was not found on GitHub')
     if not remove_update_folder():

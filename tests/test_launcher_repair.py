@@ -21,6 +21,7 @@ def release(tag, name, assets=('bbport-windows.zip',), draft=False):
 
 
 RELEASES = [
+    release('v2.2-community-1', 'Community build 1: 2.1 + open PRs (not an official release)'),
     release('qml-launcher-preview-23', 'Bloodborne Windows Launcher 2.1 (upstream fixes, language)'),
     release('qml-launcher-preview-22', 'Bloodborne Windows Launcher 2.0 (community PRs, 120/144 FPS)'),
     release('qml-launcher-preview-21', 'Bloodborne Windows Launcher 1.9.7 (map, frame generation)'),
@@ -154,7 +155,7 @@ class RepairTests(unittest.TestCase):
         def urlopen(request, timeout=None):
             if request.full_url == core.RELEASES_LIST_API:
                 return Response(json.dumps(RELEASES if releases is None else releases).encode())
-            if request.full_url == 'https://example.invalid/qml-launcher-preview-23/bbport-windows.zip':
+            if request.full_url == 'https://example.invalid/v2.2-community-1/bbport-windows.zip':
                 return Response(archive)
             raise OSError(f'unexpected {request.full_url}')
         return patch.object(core.urllib.request, 'urlopen', side_effect=urlopen)

@@ -1208,11 +1208,11 @@ class LauncherBackend(QObject):
     def _repair_fallback(self, error=None):
         more = f' and {len(self._missing) - 1} more' if len(self._missing) > 1 else ''
         text = (f'This copy of the port is incomplete: {self._missing[0]}{more} missing from {core.PORT_DIR}. '
-                f'Download the port again from {core.RELEASES_PAGE} and unpack the whole zip.') if self._missing else ''
+                f'Download the port again from {core.REPAIR_PAGE} and unpack the whole zip.') if self._missing else ''
         if error:
             text = f'Repair failed: {error}. {text}'.strip()
         self._set_notice(text)
-        webbrowser.open(core.RELEASES_PAGE)
+        webbrowser.open(core.REPAIR_PAGE)
 
     @Slot()
     def repairPort(self):

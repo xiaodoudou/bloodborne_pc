@@ -4,6 +4,16 @@ Windows releases of this fork, newest first. Each is on the
 [releases page](https://github.com/Jgamrot/bloodborne_pc/releases) as `bbport-windows.zip`.
 Planned work is in [ROADMAP.md](ROADMAP.md).
 
+## 2.2-community-1 (community build, not an official release)
+
+2.1 with every open pull request by xiaodoudou, on
+[xiaodoudou/bloodborne_pc](https://github.com/xiaodoudou/bloodborne_pc/releases/tag/v2.2-community-1):
+the GPU device-loss fixes (#157, #160, #173, #175, #176, #177, #178, #189, #191, #192, #209), old
+CPUs (#197), the GCN NaN rules (#204), effects and frame-time presets above 30 FPS (#162, #164,
+#179, #201), the shader cache (#188, #190, #193, #194), online (#172, #174, #198, #199) and the
+launcher (#142, #144, #167, #196, #202, #203). DLSS is 310.9.16 with Frame Generation. Repair
+downloads this build, and the launcher still offers the next official release.
+
 ## Unreleased
 
 - **Xbox and keyboard prompts without a Nexus download.** Choosing Xbox or Keyboard in the
