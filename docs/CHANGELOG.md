@@ -4,6 +4,11 @@ Windows releases of this fork, newest first. Each is on the
 [releases page](https://github.com/Jgamrot/bloodborne_pc/releases) as `bbport-windows.zip`.
 Planned work is in [ROADMAP.md](ROADMAP.md).
 
+## 2.2-community-2 (community build, not an official release)
+
+2.2-community-1 with 1366x768 as an output resolution (#220, issue #218), on
+[xiaodoudou/bloodborne_pc](https://github.com/xiaodoudou/bloodborne_pc/releases/tag/v2.2-community-2).
+
 ## 2.2-community-1 (community build, not an official release)
 
 2.1 with every open pull request by xiaodoudou, on
